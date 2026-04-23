@@ -41,3 +41,12 @@ All work is tracked via GitHub Issue → branch → Pull Request. No direct comm
 - Job HASH field names (`data`, `opts`, `progress`, `returnvalue`, `stacktrace`, etc.) follow BullMQ.
 - State transitions and Lua script responsibilities mirror BullMQ v5+ (see design doc Section 5).
 - Divergence from BullMQ is allowed only at the API surface (Go generics / goroutines / context), never at the Redis wire format.
+
+## Performance stance
+
+Compatibility defines the wire format; it does not cap client implementation.
+
+- Encouraged on the client side: goroutine-based concurrency, go-redis pipelining, allocation-lean JSON handling, `time.AfterFunc` for delayed-job wakeup.
+- Non-negotiable: Redis payload shape, Lua atomic semantics, and cross-language queue sharing.
+- Optimizations that assume mkq is the sole writer of a queue must opt-out when foreign workers are detected.
+- Extended Lua scripts are additive, never replacements for BullMQ-equivalent scripts.
