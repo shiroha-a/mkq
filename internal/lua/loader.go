@@ -34,6 +34,10 @@ const (
 	AddLog                ScriptName = "addLog-2"
 	GetCounts             ScriptName = "getCounts-1"
 	GetRanges             ScriptName = "getRanges-1"
+	RemoveJob             ScriptName = "removeJob-2"
+	Drain                 ScriptName = "drain-5"
+	Promote               ScriptName = "promote-9"
+	ReprocessJob          ScriptName = "reprocessJob-8"
 )
 
 // Scripter executes vendored Lua scripts via EVALSHA, with transparent
@@ -74,6 +78,7 @@ func NewScripter(ctx context.Context, client redis.Scripter) (*Scripter, error) 
 		AddJobScheduler, UpdateJobScheduler,
 		UpdateProgress, UpdateData, AddLog,
 		GetCounts, GetRanges,
+		RemoveJob, Drain, Promote, ReprocessJob,
 	} {
 		if _, err := s.load(ctx, name); err != nil {
 			return nil, fmt.Errorf("preload %s: %w", name, err)
