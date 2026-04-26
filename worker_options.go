@@ -12,6 +12,12 @@ type workerConfig struct {
 	idlePollInterval time.Duration
 	stalledInterval  time.Duration
 	maxStalledCount  int
+	limiter          *workerLimiter
+}
+
+type workerLimiter struct {
+	max      int
+	duration time.Duration
 }
 
 // Defaults mirror BullMQ where applicable.
@@ -70,4 +76,21 @@ func WithStalledInterval(d time.Duration) WorkerOption {
 // Default 1 matches BullMQ.
 func WithMaxStalledCount(n int) WorkerOption {
 	return func(c *workerConfig) { c.maxStalledCount = n }
+}
+
+// WithRateLimit caps Worker dequeue throughput at max jobs per the
+// given rolling-window duration. Mirrors BullMQ's worker.limiter
+// option: when the cap is reached, the vendored Lua returns the
+// remaining cooldown via expireTime and the dispatch loop sleeps
+// exactly that long before its next moveToActive attempt.
+//
+// max <= 0 or duration <= 0 disables rate limiting (the default).
+func WithRateLimit(max int, duration time.Duration) WorkerOption {
+	return func(c *workerConfig) {
+		if max <= 0 || duration <= 0 {
+			c.limiter = nil
+			return
+		}
+		c.limiter = &workerLimiter{max: max, duration: duration}
+	}
 }
