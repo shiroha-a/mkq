@@ -7,9 +7,10 @@ import (
 // ScheduleOpts is the BullMQ schedule template — the value
 // addJobScheduler-11.lua reads as ARGV[2] (cmsgpack-unpacked).
 //
-// `pattern` (cron) is excluded by design: the every-mode PR ships
-// without a Go cron parser. When pattern support lands, this struct
-// gains `Pattern string` and `TZ string` fields.
+// EveryMs and Pattern are mutually exclusive: every-mode lets Lua
+// recompute the next millis via getJobSchedulerEveryNextMillis,
+// while pattern-mode passes a Go-computed nextMillis in ARGV[1]
+// and Lua uses it verbatim.
 type ScheduleOpts struct {
 	// Name is the BullMQ job name written to each created instance
 	// (Job.name). Defaults to the queue name.
@@ -18,6 +19,12 @@ type ScheduleOpts struct {
 	// every-mode; the vendored Lua's getJobSchedulerEveryNextMillis
 	// computes the next fire time from this.
 	EveryMs int64
+	// Pattern is the cron expression (5-field) for pattern-mode
+	// schedules. Mutually exclusive with EveryMs.
+	Pattern string
+	// TZ is the IANA timezone name for pattern-mode (e.g.
+	// "Asia/Tokyo"). Empty = local time. Pattern-mode only.
+	TZ string
 	// StartDate (optional) is the earliest absolute ms timestamp at
 	// which the first instance fires. 0 = unset (fire as soon as
 	// possible).
@@ -35,6 +42,12 @@ func EncodeScheduleOpts(o ScheduleOpts) ([]byte, error) {
 	m := map[string]any{"name": o.Name}
 	if o.EveryMs > 0 {
 		m["every"] = o.EveryMs
+	}
+	if o.Pattern != "" {
+		m["pattern"] = o.Pattern
+	}
+	if o.TZ != "" {
+		m["tz"] = o.TZ
 	}
 	if o.StartDate > 0 {
 		m["startDate"] = o.StartDate
@@ -76,6 +89,12 @@ func EncodeScheduleDelayedOpts(o ScheduleOpts) ([]byte, error) {
 	repeat := map[string]any{}
 	if o.EveryMs > 0 {
 		repeat["every"] = o.EveryMs
+	}
+	if o.Pattern != "" {
+		repeat["pattern"] = o.Pattern
+	}
+	if o.TZ != "" {
+		repeat["tz"] = o.TZ
 	}
 	if o.StartDate > 0 {
 		repeat["startDate"] = o.StartDate

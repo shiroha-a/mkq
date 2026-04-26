@@ -92,6 +92,100 @@ func TestSchedule_LimitStops(t *testing.T) {
 	assert.GreaterOrEqual(t, icN, limit, "ic counter must reach limit")
 }
 
+// TestSchedule_EndDateStops confirms that WithScheduleEndDate caps
+// further iterations Go-side: once the next computed fire would
+// exceed endDate, the worker's reschedule path no-ops without
+// queueing the next instance. BullMQ TS performs the same check in
+// worker.getNextMillis; the gate is client-side because the lua
+// doesn't enforce it.
+func TestSchedule_EndDateStops(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "tick")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// endDate を 250ms 先に設定。every=100ms なので、iteration 0/1/2
+	// あたりまでは進み、3 回目以降は endDate 超過で止まる。
+	endDate := time.Now().Add(250 * time.Millisecond)
+	require.NoError(t, queue.UpsertScheduleEvery(ctx,
+		"sunset", 100*time.Millisecond, testPayload{},
+		mkq.WithScheduleEndDate(endDate),
+	))
+
+	var seen atomic.Int64
+	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		seen.Add(1)
+		return nil, nil
+	}, mkq.WithIdlePollInterval(20*time.Millisecond))
+	require.NoError(t, err)
+	defer worker.Stop(context.Background())
+
+	// endDate 超過後は新しい iteration が積まれないので、ある時点で
+	// 確実に増加が止まる。 endDate + 数 iteration 分の余裕で待機。
+	time.Sleep(700 * time.Millisecond)
+	stopped := seen.Load()
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, stopped, seen.Load(),
+		"schedule must stop firing after endDate (got %d -> %d)", stopped, seen.Load())
+	assert.Greater(t, stopped, int64(0),
+		"endDate must allow at least the initial iterations to fire")
+}
+
+// TestScheduleEvery_RejectsEndDateInPast pins the initial-upsert
+// endDate guard for every-mode: passing an endDate that has already
+// passed (or one that's earlier than startDate) means the schedule
+// could never fire even once, so the upsert returns an error rather
+// than persisting a dead schedule HASH.
+func TestScheduleEvery_RejectsEndDateInPast(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "tick")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	t.Run("endDate in past", func(t *testing.T) {
+		err := queue.UpsertScheduleEvery(ctx, "x", time.Second, testPayload{},
+			mkq.WithScheduleEndDate(time.Now().Add(-time.Hour)),
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "endDate")
+	})
+	t.Run("startDate after endDate", func(t *testing.T) {
+		err := queue.UpsertScheduleEvery(ctx, "x", time.Second, testPayload{},
+			mkq.WithScheduleStartDate(time.Now().Add(time.Hour)),
+			mkq.WithScheduleEndDate(time.Now().Add(time.Minute)),
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "endDate")
+	})
+}
+
+// TestSchedulePattern_RejectsFirstFireBeyondEndDate pins the
+// equivalent guard for pattern-mode: a yearly cron with endDate=24h
+// would compute firstFire as next Jan 1st (months out), creating a
+// "dead" delayed job. The upsert call rejects it instead.
+func TestSchedulePattern_RejectsFirstFireBeyondEndDate(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "tick")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := queue.UpsertSchedulePattern(ctx,
+		"yearly", "0 0 1 1 *", testPayload{},
+		mkq.WithScheduleEndDate(time.Now().Add(24*time.Hour)),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "endDate")
+}
+
 // TestSchedule_RemoveStops confirms that RemoveSchedule prevents
 // further iterations: the in-flight job (if any) finishes normally and
 // the worker's re-upsert path no-ops because the schedule HASH is gone.

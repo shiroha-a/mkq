@@ -4,22 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/shiroha-a/mkq/internal/lua"
 	"github.com/shiroha-a/mkq/internal/proto"
 )
 
-// scheduleConfig is the typed-option bag for UpsertScheduleEvery.
-// Public callers populate it via WithSchedule* options; internal
-// re-upserts (worker auto-schedule) construct it directly.
+// scheduleConfig is the typed-option bag for UpsertScheduleEvery /
+// UpsertSchedulePattern. Public callers populate it via WithSchedule*
+// options; internal re-upserts (worker auto-schedule) construct it
+// directly.
 type scheduleConfig struct {
-	limit     int
-	endDate   time.Time
-	startDate time.Time
+	limit       int
+	endDate     time.Time
+	startDate   time.Time
+	tz          string
+	immediately bool
 }
 
-// ScheduleOption customises an UpsertScheduleEvery call.
+// ScheduleOption customises an UpsertScheduleEvery / UpsertSchedulePattern
+// call. Some options (timezone, immediately) only make sense for
+// pattern-mode and are validated at upsert time.
 type ScheduleOption func(*scheduleConfig)
 
 // WithScheduleLimit caps the total number of fires for a schedule.
@@ -40,6 +46,22 @@ func WithScheduleEndDate(t time.Time) ScheduleOption {
 // after upsert".
 func WithScheduleStartDate(t time.Time) ScheduleOption {
 	return func(c *scheduleConfig) { c.startDate = t }
+}
+
+// WithScheduleTimezone sets the IANA timezone (e.g. "Asia/Tokyo")
+// in which a cron pattern is evaluated. Pattern-mode only; passing
+// it to UpsertScheduleEvery returns an error. Empty string = local
+// time, matching BullMQ's default when `tz` is omitted.
+func WithScheduleTimezone(tz string) ScheduleOption {
+	return func(c *scheduleConfig) { c.tz = tz }
+}
+
+// WithScheduleImmediately makes the first iteration fire at upsert
+// time rather than waiting for the next pattern match. Pattern-mode
+// only. Mutually exclusive with WithScheduleStartDate (BullMQ TS
+// rejects the combination at upsertJobScheduler).
+func WithScheduleImmediately() ScheduleOption {
+	return func(c *scheduleConfig) { c.immediately = true }
 }
 
 // UpsertScheduleEvery registers (or replaces) a fixed-interval
@@ -71,29 +93,18 @@ func (q *Queue[T]) UpsertScheduleEvery(
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if cfg.tz != "" || cfg.immediately {
+		return fmt.Errorf("mkq: WithScheduleTimezone / WithScheduleImmediately are pattern-mode only; use UpsertSchedulePattern")
+	}
 
 	dataJSON, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("mkq: marshal schedule payload: %w", err)
 	}
 
-	return q.upsertSchedule(ctx, scheduleID, every.Milliseconds(), cfg, string(dataJSON))
-}
-
-// upsertSchedule is the wire-level call shared by UpsertScheduleEvery
-// (public) and the worker's auto-rescheduling path.
-func (q *Queue[T]) upsertSchedule(
-	ctx context.Context,
-	scheduleID string,
-	everyMs int64,
-	cfg scheduleConfig,
-	dataJSON string,
-) error {
-	now := time.Now().UnixMilli()
-
 	scheduleOpts := proto.ScheduleOpts{
 		Name:    q.name,
-		EveryMs: everyMs,
+		EveryMs: every.Milliseconds(),
 		Limit:   cfg.limit,
 	}
 	if !cfg.startDate.IsZero() {
@@ -102,6 +113,118 @@ func (q *Queue[T]) upsertSchedule(
 	if !cfg.endDate.IsZero() {
 		scheduleOpts.EndDate = cfg.endDate.UnixMilli()
 	}
+
+	// every-mode の初回 fire は max(startDate, now)。lua の
+	// getJobSchedulerEveryNextMillis と同じ式を Go 側で再現し、
+	// firstFire > endDate なら dead schedule を作らずに reject。
+	// pattern-mode 側 (UpsertSchedulePattern) と同じ gating ポリシー。
+	if !cfg.endDate.IsZero() {
+		firstFire := time.Now()
+		if !cfg.startDate.IsZero() && cfg.startDate.After(firstFire) {
+			firstFire = cfg.startDate
+		}
+		if firstFire.After(cfg.endDate) {
+			return fmt.Errorf("mkq: first fire %v exceeds endDate %v; schedule would never run", firstFire, cfg.endDate)
+		}
+	}
+
+	// every-mode は ARGV[1]="0" → lua が getJobSchedulerEveryNextMillis
+	// で次 millis を再計算する。
+	return q.upsertSchedule(ctx, scheduleID, "0", scheduleOpts, string(dataJSON))
+}
+
+// UpsertSchedulePattern registers (or replaces) a cron-pattern
+// recurring schedule. Behaves like UpsertScheduleEvery except next
+// fire times are derived from the cron expression Go-side (see
+// cron.go for the supported subset, which mirrors BullMQ's
+// cron-parser@4.9.0 mainstream syntax).
+//
+// pattern is a 5-field cron expression or a standard descriptor
+// macro (`@daily`, etc.). `@every <duration>` is rejected — use
+// UpsertScheduleEvery for fixed intervals.
+//
+// WithScheduleTimezone(tz) controls the timezone for evaluation
+// (default: local). WithScheduleImmediately() makes the first
+// iteration fire at upsert time; mutually exclusive with
+// WithScheduleStartDate per BullMQ TS validation.
+func (q *Queue[T]) UpsertSchedulePattern(
+	ctx context.Context,
+	scheduleID string,
+	pattern string,
+	payload T,
+	opts ...ScheduleOption,
+) error {
+	if scheduleID == "" {
+		return fmt.Errorf("mkq: scheduleID must be non-empty")
+	}
+
+	cfg := scheduleConfig{}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.immediately && !cfg.startDate.IsZero() {
+		return fmt.Errorf("mkq: WithScheduleImmediately and WithScheduleStartDate are mutually exclusive")
+	}
+
+	cc, err := parseCron(pattern, cfg.tz)
+	if err != nil {
+		return err
+	}
+
+	dataJSON, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("mkq: marshal schedule payload: %w", err)
+	}
+
+	scheduleOpts := proto.ScheduleOpts{
+		Name:    q.name,
+		Pattern: pattern,
+		TZ:      cfg.tz,
+		Limit:   cfg.limit,
+	}
+	if !cfg.startDate.IsZero() {
+		scheduleOpts.StartDate = cfg.startDate.UnixMilli()
+	}
+	if !cfg.endDate.IsZero() {
+		scheduleOpts.EndDate = cfg.endDate.UnixMilli()
+	}
+
+	// pattern-mode は Go 側で次 millis を計算して ARGV[1] に渡す。
+	// immediately なら今すぐ、startDate があればそれ以降の最初の
+	// pattern マッチ、それ以外は now 以降の最初のマッチ。
+	now := time.Now()
+	var firstFire time.Time
+	switch {
+	case cfg.immediately:
+		firstFire = now
+	case !cfg.startDate.IsZero():
+		firstFire = cc.nextFire(cfg.startDate)
+	default:
+		firstFire = cc.nextFire(now)
+	}
+	// endDate を超えた firstFire を許すと、yearly cron + endDate=24h の
+	// ように lua 側で月単位の delay job を作ってしまう。worker の
+	// rescheduleNext が以後の iteration を gate するのと同じロジックを
+	// 初回 upsert にも適用し、dead schedule の作成を未然に弾く。
+	if !cfg.endDate.IsZero() && firstFire.After(cfg.endDate) {
+		return fmt.Errorf("mkq: first fire %v exceeds endDate %v; schedule would never run", firstFire, cfg.endDate)
+	}
+	nextMillis := strconv.FormatInt(firstFire.UnixMilli(), 10)
+
+	return q.upsertSchedule(ctx, scheduleID, nextMillis, scheduleOpts, string(dataJSON))
+}
+
+// upsertSchedule is the wire-level call shared by UpsertScheduleEvery,
+// UpsertSchedulePattern, and the worker's auto-rescheduling path.
+// `nextMillis` is "0" for every-mode (lua recomputes) or the
+// pre-computed pattern next-fire ms timestamp as a decimal string.
+func (q *Queue[T]) upsertSchedule(
+	ctx context.Context,
+	scheduleID string,
+	nextMillis string,
+	scheduleOpts proto.ScheduleOpts,
+	dataJSON string,
+) error {
 	scheduleOptsBytes, err := proto.EncodeScheduleOpts(scheduleOpts)
 	if err != nil {
 		return fmt.Errorf("mkq: encode schedule opts: %w", err)
@@ -111,18 +234,20 @@ func (q *Queue[T]) upsertSchedule(
 		return fmt.Errorf("mkq: encode template opts: %w", err)
 	}
 	// 各 iteration の job HASH に書かれる opts。BullMQ TS Worker は
-	// 自前で再スケジュールするとき opts.repeat.every を参照するので、
-	// foreign worker と互換にするため repeat ブロックを必ず埋める。
+	// 自前で再スケジュールするとき opts.repeat.every / pattern を
+	// 参照するので、foreign worker と互換にするため repeat ブロックを
+	// 必ず埋める。
 	delayedOptsBytes, err := proto.EncodeScheduleDelayedOpts(scheduleOpts)
 	if err != nil {
 		return fmt.Errorf("mkq: encode delayed opts: %w", err)
 	}
 
+	now := time.Now().UnixMilli()
 	res, err := q.client.scripts.Run(
 		ctx,
 		lua.AddJobScheduler,
 		q.scheduleKeys(),
-		"0", // ARGV[1] nextMillis: every-mode は lua が再計算
+		nextMillis,
 		scheduleOptsBytes,
 		scheduleID,
 		dataJSON,

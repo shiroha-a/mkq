@@ -476,10 +476,13 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 	defer cancel()
 
 	// limit=0 (unset) は cap なし。limit>0 かつ ic>=limit で打ち止め。
-	// every は次 iteration の opts.repeat に詰めるため必須。HMGET は
-	// scheduler が消えていれば nil を返すので、その場合 lua 側 no-op。
-	vals, err := w.rdb.HMGet(ctx, scheduleKey, "limit", "ic", "every", "startDate", "endDate").Result()
-	if err != nil || len(vals) != 5 {
+	// every / pattern のいずれかが必須 (両者とも未設定なら HASH が
+	// 消えている = no-op で終了)。HMGET は scheduler が消えていれば
+	// nil を返すので、その場合は startDate/endDate も nil で安全。
+	vals, err := w.rdb.HMGet(ctx, scheduleKey,
+		"limit", "ic", "every", "startDate", "endDate", "pattern", "tz",
+	).Result()
+	if err != nil || len(vals) != 7 {
 		return
 	}
 	limit := parseInt(asString(vals[0]))
@@ -488,25 +491,62 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 		return
 	}
 	everyMs, _ := strconv.ParseInt(asString(vals[2]), 10, 64)
-	if everyMs <= 0 {
-		// every が未設定 = pattern モードか、HASH が消えている。
-		// pattern モードは未対応なので no-op。
-		return
-	}
 	startDate, _ := strconv.ParseInt(asString(vals[3]), 10, 64)
 	endDate, _ := strconv.ParseInt(asString(vals[4]), 10, 64)
+	pattern := asString(vals[5])
+	tz := asString(vals[6])
 
-	delayedOpts, err := proto.EncodeScheduleDelayedOpts(proto.ScheduleOpts{
+	if everyMs <= 0 && pattern == "" {
+		// HASH が消えた、または不完全な状態。lua の prevMillis check に
+		// 任せても良いが、ここで早期 return しておけば余計な EVAL を省ける。
+		return
+	}
+
+	scheduleProto := proto.ScheduleOpts{
 		EveryMs:   everyMs,
+		Pattern:   pattern,
+		TZ:        tz,
 		StartDate: startDate,
 		EndDate:   endDate,
 		Limit:     limit,
-	})
+	}
+	delayedOpts, err := proto.EncodeScheduleDelayedOpts(scheduleProto)
 	if err != nil {
 		return
 	}
 
-	now := time.Now().UnixMilli()
+	// pattern-mode は Go 側で次 millis を計算 → ARGV[1]。
+	// every-mode は "0" を渡し、lua が getJobSchedulerEveryNextMillis
+	// で計算する。every-mode の場合は endDate ガードを行うために
+	// nextMillis を Go 側でも算出する (lua に任せるとガードできない)。
+	nowTime := time.Now()
+	now := nowTime.UnixMilli()
+	nextMillisArg := "0"
+	var nextMillisVal int64
+	switch {
+	case pattern != "":
+		cc, err := parseCron(pattern, tz)
+		if err != nil {
+			// HASH に書かれている pattern が parse できない = データ
+			// 破損 or 別 client が書き換えた。ログ手段がまだ無いので
+			// no-op (次 iteration が出ないだけ)。
+			return
+		}
+		nextMillisVal = cc.nextFire(nowTime).UnixMilli()
+		nextMillisArg = strconv.FormatInt(nextMillisVal, 10)
+	default: // every-mode
+		// getJobSchedulerEveryNextMillis のロジック: 前回 fire 時刻 +
+		// every。前回 fire 時刻が無い (初回) なら startDate or now。
+		// rescheduleNext は worker が job を完了した直後に呼ばれるので、
+		// 必ず prevMillis が ZSCORE で取れる前提だが、endDate ガード
+		// 用途では now + every で近似すれば十分。
+		nextMillisVal = now + everyMs
+	}
+	if endDate > 0 && nextMillisVal > endDate {
+		// BullMQ TS は worker.getNextMillis() で同様の endDate チェックを
+		// 行っており、超過した場合は新しい iteration を作らない。
+		return
+	}
 	keysArg := []string{
 		w.keys.repeat,      // KEYS[1]  repeat
 		w.keys.delayed,     // KEYS[2]  delayed
@@ -526,10 +566,10 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 		ctx,
 		lua.UpdateJobScheduler,
 		keysArg,
-		"0",           // ARGV[1] nextMillis: every-mode は lua が再計算
+		nextMillisArg, // ARGV[1] nextMillis: every="0" / pattern=Go計算値
 		scheduleID,    // ARGV[2]
 		"{}",          // ARGV[3] data fallback (HASH 優先)
-		delayedOpts,   // ARGV[4] msgpack delayed opts (repeat.every 含む)
+		delayedOpts,   // ARGV[4] msgpack delayed opts (repeat.every / pattern 含む)
 		now,           // ARGV[5]
 		w.keys.prefix, // ARGV[6]
 		currentJobID,  // ARGV[7] producerId — current job ID で dedupe
