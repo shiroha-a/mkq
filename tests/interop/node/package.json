@@ -1,0 +1,15 @@
+{
+  "name": "mkq-interop",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Node-side runner for mkq <-> BullMQ TS interop smoke tests. Pin matches third_party/bullmq submodule.",
+  "type": "module",
+  "scripts": {
+    "worker": "node worker.js",
+    "enqueuer": "node enqueuer.js"
+  },
+  "dependencies": {
+    "bullmq": "5.76.2",
+    "ioredis": "5.10.1"
+  }
+}

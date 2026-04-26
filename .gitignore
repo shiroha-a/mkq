@@ -33,3 +33,6 @@ go.work.sum
 
 # Local design / task scratch (per CLAUDE.md workflow)
 .tmp/
+
+# Node deps for interop harness (regenerated from package-lock.json)
+tests/interop/node/node_modules/

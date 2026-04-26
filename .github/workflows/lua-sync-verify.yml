@@ -35,3 +35,14 @@ jobs:
             exit 1
           fi
           echo "OK: vendored lua matches submodule pin"
+
+      - name: verify interop bullmq pin matches submodule
+        run: |
+          submodule_version=$(jq -r '.version' third_party/bullmq/package.json)
+          interop_version=$(jq -r '.dependencies.bullmq' tests/interop/node/package.json)
+          if [ "$submodule_version" != "$interop_version" ]; then
+            echo "::error::bullmq version mismatch: third_party/bullmq pin says $submodule_version, tests/interop/node/package.json says $interop_version"
+            echo "Bump tests/interop/node/package.json to match the submodule, or vice versa."
+            exit 1
+          fi
+          echo "OK: interop bullmq pin ($interop_version) matches submodule"
