@@ -25,6 +25,19 @@ import (
 // the job's WithAttempts / WithBackoff configuration. Wrapping the
 // returned error with ErrUnrecoverable forces the failed transition
 // regardless of remaining attempts.
+//
+// Notes mirroring BullMQ behaviour:
+//   - Panics inside the handler are recovered, recorded in the
+//     stacktrace HASH field, and treated as a regular error — they
+//     are eligible for retry under WithAttempts. Use
+//     ErrUnrecoverable inside an explicit recover() if you need
+//     panics to be terminal.
+//   - The `retries-exhausted` event in the BullMQ events stream
+//     fires whenever a job lands in `failed` and `attemptsMade`
+//     reached the configured `attempts`. With the default (no
+//     WithAttempts), `attempts` is 0 and any failure satisfies the
+//     gate, so the event fires immediately. This matches BullMQ TS
+//     wire-format behaviour.
 type Handler[T any] func(ctx context.Context, job *Job[T]) (any, error)
 
 // Worker is the lifecycle handle returned by Process. It owns its
@@ -374,9 +387,11 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, target, ms
 		return fmt.Errorf("encode finish opts: %w", err)
 	}
 
-	fields := []any{"finishedOn", now}
-	fields = append(fields, extraFields...)
-	jobFields, err := proto.EncodeJobFields(fields...)
+	// `finishedOn` を ARGV[9] に積まない: moveToFinished-14.lua が
+	// 末尾で HSET timestamp 同値を書き込むため重複になる。空 / extra
+	// だけを渡すことで余計な HMSET ペアを削減し、BullMQ TS の
+	// updateData 設計と揃える。
+	jobFields, err := proto.EncodeJobFields(extraFields...)
 	if err != nil {
 		return fmt.Errorf("encode job fields: %w", err)
 	}
