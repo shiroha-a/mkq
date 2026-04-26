@@ -272,6 +272,49 @@ func TestWorker_Process_PriorityOrderingWithinPrioritized(t *testing.T) {
 	assert.Equal(t, low.ID, second)
 }
 
+// TestWorker_Process_DelayedJobRunsAfterDelay pins that delayed jobs
+// (added via WithDelay) get picked up by the worker once their delay
+// elapses. mkq doesn't run a separate scheduler — promotion is
+// performed inline by moveToActive-11.lua's promoteDelayedJobs call
+// every dequeue tick — so this test is the regression guarantee that
+// the polling loop + vendored Lua combination still works end-to-end.
+func TestWorker_Process_DelayedJobRunsAfterDelay(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const delay = 80 * time.Millisecond
+	addedAt := time.Now()
+	job, err := queue.Add(ctx, testPayload{Inbox: "delayed"},
+		mkq.WithDelay(delay),
+	)
+	require.NoError(t, err)
+
+	ranAt := make(chan time.Time, 1)
+	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		ranAt <- time.Now()
+		return nil, nil
+	}, mkq.WithIdlePollInterval(20*time.Millisecond))
+	require.NoError(t, err)
+	defer worker.Stop(context.Background())
+
+	got := receiveOrFail(t, ctx, ranAt)
+	elapsed := got.Sub(addedAt)
+	assert.GreaterOrEqual(t, elapsed, delay-10*time.Millisecond,
+		"handler must not run before the delay (got elapsed=%v)", elapsed)
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+	waitFor(t, ctx, 20*time.Millisecond, func() bool {
+		v, _ := rdb.ZScore(ctx, base+"completed", job.ID).Result()
+		return v > 0
+	})
+}
+
 func TestWorker_Stop_DrainsInflight(t *testing.T) {
 	t.Parallel()
 	prefix := uniquePrefix(t)

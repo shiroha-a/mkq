@@ -13,12 +13,14 @@ type queueConfig struct {
 }
 
 type addConfig struct {
-	jobID    string
-	delay    time.Duration
-	attempts int
-	priority uint32
-	lifo     bool
-	backoff  *BackoffStrategy
+	jobID         string
+	delay         time.Duration
+	attempts      int
+	priority      uint32
+	lifo          bool
+	backoff       *BackoffStrategy
+	keepCompleted *int
+	keepFailed    *int
 }
 
 // WithJobID forces the job id instead of letting Redis INCR allocate
@@ -57,4 +59,19 @@ func WithLifo(lifo bool) AddOption {
 // WithBackoff sets the retry backoff strategy.
 func WithBackoff(b BackoffStrategy) AddOption {
 	return func(c *addConfig) { c.backoff = &b }
+}
+
+// WithKeepCompleted bounds the size of the completed ZSET. n==0 makes
+// each completed job removed immediately (BullMQ removeOnComplete=true);
+// n>0 keeps the most recent n entries via the vendored
+// removeJobsByMaxCount Lua. Not calling WithKeepCompleted preserves
+// BullMQ's default (keep all completed jobs).
+func WithKeepCompleted(n int) AddOption {
+	return func(c *addConfig) { c.keepCompleted = &n }
+}
+
+// WithKeepFailed bounds the size of the failed ZSET, mirroring
+// WithKeepCompleted's semantics for the failure path.
+func WithKeepFailed(n int) AddOption {
+	return func(c *addConfig) { c.keepFailed = &n }
 }

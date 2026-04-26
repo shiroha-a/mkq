@@ -29,6 +29,12 @@ type AddOpts struct {
 	// Lifo flips the wait list push direction so newer jobs are
 	// processed first.
 	Lifo bool
+	// RemoveOnComplete / RemoveOnFail mirror BullMQ's per-job
+	// retention. nil means "not set" (BullMQ default = keep all).
+	// A non-nil value (including 0) is forwarded to Lua: 0 trims
+	// immediately, n>0 keeps the most recent n entries.
+	RemoveOnComplete *int
+	RemoveOnFail     *int
 }
 
 // Backoff matches BullMQ's BackoffOptions shape ({type, delay}).
@@ -62,6 +68,12 @@ func EncodeAddOpts(o AddOpts) ([]byte, error) {
 	}
 	if o.Lifo {
 		m["lifo"] = true
+	}
+	if o.RemoveOnComplete != nil {
+		m["removeOnComplete"] = *o.RemoveOnComplete
+	}
+	if o.RemoveOnFail != nil {
+		m["removeOnFail"] = *o.RemoveOnFail
 	}
 	return msgpack.Marshal(m)
 }
