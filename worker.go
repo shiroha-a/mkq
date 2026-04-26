@@ -827,10 +827,14 @@ func buildJob[T any](jobID string, jobMap map[string]string) (*Job[T], error) {
 	}
 	tsMs, _ := strconv.ParseInt(jobMap["timestamp"], 10, 64)
 	return &Job[T]{
-		ID:        jobID,
-		Name:      jobMap["name"],
-		Data:      data,
-		Timestamp: time.UnixMilli(tsMs),
+		ID:              jobID,
+		Name:            jobMap["name"],
+		Data:            data,
+		Timestamp:       time.UnixMilli(tsMs),
+		AttemptsMade:    parseInt(jobMap["atm"]),
+		AttemptsStarted: parseInt(jobMap["ats"]),
+		StalledCounter:  parseInt(jobMap["stc"]),
+		ProcessedBy:     jobMap["pb"],
 	}, nil
 }
 

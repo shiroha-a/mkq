@@ -24,12 +24,29 @@ type Queue[T any] struct {
 
 // Define returns a Queue handle for name. Calling Define twice with the
 // same name is safe; both handles operate on identical Redis state.
+//
+// Side effect: Define writes mkq's library version into the BullMQ
+// `meta` HASH via HSETNX. The non-overwriting semantics matter for
+// queues already initialised by a foreign client (BullMQ TS would
+// have written `bullmq:<semver>`); we only stamp `mkq:<semver>` when
+// the field is missing.
 func Define[T any](c *Client, name string, _ ...QueueOption) *Queue[T] {
-	return &Queue[T]{
+	q := &Queue[T]{
 		client: c,
 		name:   name,
 		keys:   keys.New(c.keyPrefix, name),
 	}
+	q.stampVersion()
+	return q
+}
+
+// stampVersion is best-effort: a Redis hiccup here doesn't break the
+// queue, it just leaves the version field unwritten. The interop test
+// will catch that on the next bull-board read.
+func (q *Queue[T]) stampVersion() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = q.client.rdb.HSetNX(ctx, q.keys.Meta(), "version", versionTag()).Err()
 }
 
 // Name returns the queue name as passed to Define.
@@ -189,6 +206,65 @@ func buildRetentionLimit(count *int, age *time.Duration) *proto.RetentionLimit {
 		rl.AgeSeconds = &secs
 	}
 	return rl
+}
+
+// Get returns a snapshot of the BullMQ HASH for jobID. Useful for
+// admin / inspector flows; the worker dispatch path does not call
+// this. Returns ErrJobNotFound when no HASH exists at the expected
+// key.
+//
+// The Job[T] return value carries the user-facing identity (ID /
+// Name / Data) and the dequeue counters (AttemptsMade etc.). The
+// JobState carries fields that only become meaningful after
+// processing starts (ProcessedOn / FinishedOn / ReturnValue / ...).
+func (q *Queue[T]) Get(ctx context.Context, jobID string) (*Job[T], *JobState, error) {
+	hash, err := q.client.rdb.HGetAll(ctx, q.keys.Job(jobID)).Result()
+	if err != nil {
+		return nil, nil, fmt.Errorf("mkq: HGetAll %s: %w", jobID, err)
+	}
+	if len(hash) == 0 {
+		return nil, nil, ErrJobNotFound
+	}
+	job, err := buildJob[T](jobID, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return job, buildJobState(hash), nil
+}
+
+// buildJobState extracts the post-processing fields from a HGETALL
+// snapshot. Missing fields stay at their Go zero values.
+//
+// Timestamp fields are parsed via strconv.ParseInt with bitSize=64
+// rather than parseInt (which delegates to strconv.Atoi → int) so
+// that 13-digit Unix-millisecond values survive on 32-bit platforms
+// where int wraps at ~2.1 × 10^9. Mirrors the existing buildJob
+// timestamp parsing in worker.go.
+func buildJobState(hash map[string]string) *JobState {
+	st := &JobState{
+		FailedReason: hash["failedReason"],
+	}
+	if v, err := strconv.ParseInt(hash["processedOn"], 10, 64); err == nil && v > 0 {
+		st.ProcessedOn = time.UnixMilli(v)
+	}
+	if v, err := strconv.ParseInt(hash["finishedOn"], 10, 64); err == nil && v > 0 {
+		st.FinishedOn = time.UnixMilli(v)
+	}
+	if rv := hash["returnvalue"]; rv != "" {
+		st.ReturnValue = json.RawMessage(rv)
+	}
+	if pg := hash["progress"]; pg != "" {
+		st.Progress = json.RawMessage(pg)
+	}
+	if st_ := hash["stacktrace"]; st_ != "" {
+		// BullMQ は stacktrace を JSON エンコードされた文字列配列として保存する。
+		// best-effort デコード; 不正入力 → 空スライス。
+		var traces []string
+		if err := json.Unmarshal([]byte(st_), &traces); err == nil {
+			st.Stacktrace = traces
+		}
+	}
+	return st
 }
 
 // parseAddResult coerces the polymorphic EVALSHA return into a job id
