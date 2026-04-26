@@ -148,20 +148,19 @@ func (w *Worker) Stop(ctx context.Context) error {
 
 // dispatchLoop is one slot of the goroutine pool. It repeatedly tries
 // to dequeue a job and process it, sleeping IdlePollInterval between
-// empty pulls and exiting when runCtx is cancelled.
+// empty pulls (or the rate-limit cooldown if Lua reported one) and
+// exiting when runCtx is cancelled.
 func (w *Worker) dispatchLoop(handlerAny any) {
 	defer w.run.Done()
 	for {
 		if w.runCtx.Err() != nil {
 			return
 		}
-		processed, err := w.tryOnce(handlerAny)
+		processed, expireTimeMs, err := w.tryOnce(handlerAny)
 		if err != nil {
 			// 取得や lua 失敗はログ的扱い (worker は止めない)。
 			// 本格的なエラー報告チャネルは observability PR で導入。
-			select {
-			case <-time.After(w.cfg.idlePollInterval):
-			case <-w.runCtx.Done():
+			if !w.sleep(w.cfg.idlePollInterval) {
 				return
 			}
 			continue
@@ -169,11 +168,32 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 		if processed {
 			continue
 		}
-		select {
-		case <-time.After(w.cfg.idlePollInterval):
-		case <-w.runCtx.Done():
+		// Rate-limited path: respect the precise cooldown the Lua
+		// returned via expireTime instead of falling through to the
+		// idle poll interval.
+		wait := w.cfg.idlePollInterval
+		if expireTimeMs > 0 {
+			wait = time.Duration(expireTimeMs) * time.Millisecond
+		}
+		if !w.sleep(wait) {
 			return
 		}
+	}
+}
+
+// sleep blocks for d or until runCtx is cancelled. Returns false if
+// runCtx fired (caller should exit).
+func (w *Worker) sleep(d time.Duration) bool {
+	if d <= 0 {
+		return w.runCtx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-w.runCtx.Done():
+		return false
 	}
 }
 
@@ -220,18 +240,27 @@ func (w *Worker) runStalledCheck() error {
 }
 
 // tryOnce performs one dequeue attempt and, if successful, runs the
-// handler and finalises the job. Returns (processed, err).
-func (w *Worker) tryOnce(handlerAny any) (bool, error) {
+// handler and finalises the job. Returns (processed, expireTimeMs,
+// err): expireTimeMs is the rate-limit cooldown the dispatcher
+// should sleep before its next call (0 = no rate-limit window).
+func (w *Worker) tryOnce(handlerAny any) (bool, int64, error) {
 	token := uuid.NewString()
 	now := time.Now().UnixMilli()
 
-	optsBytes, err := proto.EncodeMoveToActiveOpts(proto.MoveToActiveOpts{
+	mtaOpts := proto.MoveToActiveOpts{
 		Token:        token,
 		LockDuration: w.cfg.lockDuration.Milliseconds(),
 		Name:         w.cfg.workerName,
-	})
+	}
+	if l := w.cfg.limiter; l != nil {
+		mtaOpts.Limiter = &proto.MoveToActiveLimiter{
+			Max:        l.max,
+			DurationMs: l.duration.Milliseconds(),
+		}
+	}
+	optsBytes, err := proto.EncodeMoveToActiveOpts(mtaOpts)
 	if err != nil {
-		return false, fmt.Errorf("encode moveToActive opts: %w", err)
+		return false, 0, fmt.Errorf("encode moveToActive opts: %w", err)
 	}
 
 	res, err := w.scripts.Run(
@@ -244,17 +273,17 @@ func (w *Worker) tryOnce(handlerAny any) (bool, error) {
 	)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return false, nil
+			return false, 0, nil
 		}
-		return false, fmt.Errorf("moveToActive: %w", err)
+		return false, 0, fmt.Errorf("moveToActive: %w", err)
 	}
 
-	jobMap, jobID, ok, err := parseMoveToActiveResult(res)
+	jobMap, jobID, ok, expireTimeMs, err := parseMoveToActiveResult(res)
 	if err != nil {
-		return false, fmt.Errorf("parse moveToActive: %w", err)
+		return false, 0, fmt.Errorf("parse moveToActive: %w", err)
 	}
 	if !ok {
-		return false, nil
+		return false, expireTimeMs, nil
 	}
 
 	// `defa` (default failed reason) is set by moveStalledJobsToWait
@@ -276,11 +305,11 @@ func (w *Worker) tryOnce(handlerAny any) (bool, error) {
 				w.cfg.lockDuration.Milliseconds(),
 			)
 		}
-		return true, nil
+		return true, 0, nil
 	}
 
 	w.processJob(handlerAny, token, jobID, jobMap)
-	return true, nil
+	return true, 0, nil
 }
 
 // processJob runs the handler for one acquired job, manages the lock
@@ -781,28 +810,52 @@ func buildJob[T any](jobID string, jobMap map[string]string) (*Job[T], error) {
 // parseMoveToActiveResult interprets the polymorphic EVALSHA response.
 // Lua returns one of:
 //   - {HGETALL_array, jobId, 0, 0} on success
-//   - {0, 0, expireTime, 0} when rate-limited (treated as no job)
+//   - {0, 0, expireTime, 0} when rate-limited
 //   - {0, 0, 0, nextDelayedTs} when waiting on a delayed job
 //   - {0, 0, 0, 0} when paused / maxed / empty
-func parseMoveToActiveResult(res any) (jobMap map[string]string, jobID string, ok bool, err error) {
+//
+// expireTimeMs surfaces the rate-limit cooldown so dispatchLoop can
+// sleep precisely instead of falling through to idlePollInterval.
+func parseMoveToActiveResult(res any) (jobMap map[string]string, jobID string, ok bool, expireTimeMs int64, err error) {
 	arr, isArr := res.([]any)
-	if !isArr || len(arr) < 2 {
-		return nil, "", false, nil
+	if !isArr || len(arr) < 4 {
+		return nil, "", false, 0, nil
 	}
 	jobData, isJobData := arr[0].([]any)
 	if !isJobData {
-		// arr[0] が integer (=0) のとき = job 無し。
-		return nil, "", false, nil
+		// arr[0] が integer (=0) のとき = job 無し。Slot 3 (1-indexed
+		// なら ARGV の解説と同じだが Go では index 2) が rate-limit の
+		// expireTime ms。
+		expireTimeMs, _ = toInt64(arr[2])
+		return nil, "", false, expireTimeMs, nil
 	}
 	id, idOK := arr[1].(string)
 	if !idOK || id == "" {
-		return nil, "", false, nil
+		return nil, "", false, 0, nil
 	}
 	m, err := flatHashToMap(jobData)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", false, 0, err
 	}
-	return m, id, true, nil
+	return m, id, true, 0, nil
+}
+
+// toInt64 normalises the integer types go-redis can surface for an
+// EVALSHA result element (int64 / int / int32 / float64) to int64.
+// In practice go-redis v9 returns int64 for Lua integer returns;
+// the other cases stay covered for forward compatibility.
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	}
+	return 0, false
 }
 
 // flatHashToMap turns Redis HGETALL output `[k1, v1, k2, v2, ...]` into
