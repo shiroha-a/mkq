@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/shiroha-a/mkq/internal/keys"
 	"github.com/shiroha-a/mkq/internal/lua"
 	"github.com/shiroha-a/mkq/internal/proto"
 )
@@ -79,6 +80,11 @@ type queueKeys struct {
 	completed, failed                          string
 	stalledCheck                               string
 	prefix                                     string
+	// repeat / id are needed for the worker-side re-schedule path
+	// (updateJobScheduler-12). builder retained so the worker can
+	// derive per-scheduleID HASH keys without re-deriving the prefix.
+	repeat, id string
+	builder    keys.Builder
 }
 
 // Process starts a worker that pulls jobs from q and runs h on each.
@@ -360,6 +366,14 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 			w.cfg.lockDuration.Milliseconds(),
 		)
 	}
+
+	// 周期スケジュール (rjk) が紐付いている job は、仕上げ後に
+	// 次 iteration をキューに積む。BullMQ TS と同じく
+	// updateJobScheduler-12 を 1 度叩いて HASH の every / ic /
+	// limit を読みつつ delayed に挿入する。
+	if rjk := jobMap["rjk"]; rjk != "" {
+		w.rescheduleNext(rjk, jobID)
+	}
 }
 
 // handlerOutcome captures the result of invoking a handler. Exactly
@@ -443,6 +457,93 @@ func (w *Worker) heartbeat(ctx context.Context, done chan<- struct{}, token, job
 			}
 		}
 	}
+}
+
+// rescheduleNext queues the next iteration of a recurring schedule via
+// updateJobScheduler-12.lua, gated by the schedule HASH's `limit`
+// counter (BullMQ does not enforce limit Lua-side, so the worker
+// short-circuits before invoking the script when the cap is reached).
+//
+// The lua itself reads the schedule template (every, name, data, etc.)
+// directly out of the HASH, increments `ic`, and inserts a single new
+// instance into the delayed ZSET. If RemoveSchedule has dropped the
+// HASH between dequeue and finalise, the lua's prevMillis check no-ops
+// silently.
+func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
+	scheduleKey := w.keys.builder.Schedule(scheduleID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// limit=0 (unset) は cap なし。limit>0 かつ ic>=limit で打ち止め。
+	// every は次 iteration の opts.repeat に詰めるため必須。HMGET は
+	// scheduler が消えていれば nil を返すので、その場合 lua 側 no-op。
+	vals, err := w.rdb.HMGet(ctx, scheduleKey, "limit", "ic", "every", "startDate", "endDate").Result()
+	if err != nil || len(vals) != 5 {
+		return
+	}
+	limit := parseInt(asString(vals[0]))
+	ic := parseInt(asString(vals[1]))
+	if limit > 0 && ic >= limit {
+		return
+	}
+	everyMs, _ := strconv.ParseInt(asString(vals[2]), 10, 64)
+	if everyMs <= 0 {
+		// every が未設定 = pattern モードか、HASH が消えている。
+		// pattern モードは未対応なので no-op。
+		return
+	}
+	startDate, _ := strconv.ParseInt(asString(vals[3]), 10, 64)
+	endDate, _ := strconv.ParseInt(asString(vals[4]), 10, 64)
+
+	delayedOpts, err := proto.EncodeScheduleDelayedOpts(proto.ScheduleOpts{
+		EveryMs:   everyMs,
+		StartDate: startDate,
+		EndDate:   endDate,
+		Limit:     limit,
+	})
+	if err != nil {
+		return
+	}
+
+	now := time.Now().UnixMilli()
+	keysArg := []string{
+		w.keys.repeat,      // KEYS[1]  repeat
+		w.keys.delayed,     // KEYS[2]  delayed
+		w.keys.wait,        // KEYS[3]  wait
+		w.keys.paused,      // KEYS[4]  paused
+		w.keys.meta,        // KEYS[5]  meta
+		w.keys.prioritized, // KEYS[6]  prioritized
+		w.keys.marker,      // KEYS[7]  marker
+		w.keys.id,          // KEYS[8]  id
+		w.keys.events,      // KEYS[9]  events
+		w.keys.pc,          // KEYS[10] pc
+		"",                 // KEYS[11] producer key (unused)
+		w.keys.active,      // KEYS[12] active
+	}
+
+	_, _ = w.scripts.Run(
+		ctx,
+		lua.UpdateJobScheduler,
+		keysArg,
+		"0",           // ARGV[1] nextMillis: every-mode は lua が再計算
+		scheduleID,    // ARGV[2]
+		"{}",          // ARGV[3] data fallback (HASH 優先)
+		delayedOpts,   // ARGV[4] msgpack delayed opts (repeat.every 含む)
+		now,           // ARGV[5]
+		w.keys.prefix, // ARGV[6]
+		currentJobID,  // ARGV[7] producerId — current job ID で dedupe
+	)
+}
+
+func asString(v any) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // finalise dispatches the terminal-state Lua call for a job. On
@@ -948,6 +1049,9 @@ func newQueueKeys[T any](q *Queue[T]) queueKeys {
 		failed:       b.Failed(),
 		stalledCheck: b.StalledCheck(),
 		prefix:       b.Base(),
+		repeat:       b.Repeat(),
+		id:           b.ID(),
+		builder:      b,
 	}
 }
 

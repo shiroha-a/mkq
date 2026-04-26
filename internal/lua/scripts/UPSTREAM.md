@@ -31,6 +31,8 @@ Entry points:
 - `retryJob-11.lua`
 - `moveToDelayed-12.lua`
 - `moveStalledJobsToWait-8.lua`
+- `addJobScheduler-11.lua`
+- `updateJobScheduler-12.lua`
 
 `includes/` — every script transitively reachable from the entry points
 above via `--- @include "..."` directives.

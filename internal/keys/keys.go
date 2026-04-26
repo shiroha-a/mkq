@@ -71,6 +71,13 @@ func (b Builder) Limiter() string { return b.Base() + "limiter" }
 // Repeat is the ZSET of repeat job templates.
 func (b Builder) Repeat() string { return b.Base() + "repeat" }
 
+// Schedule returns the per-scheduleID HASH key under the repeat
+// namespace. BullMQ stores each scheduler's template (data, opts,
+// every, ic counter) at `{prefix}:{queue}:repeat:<scheduleID>`.
+func (b Builder) Schedule(scheduleID string) string {
+	return b.Base() + "repeat:" + scheduleID
+}
+
 // Job returns the per-job HASH key.
 func (b Builder) Job(jobID string) string { return b.Base() + jobID }
 

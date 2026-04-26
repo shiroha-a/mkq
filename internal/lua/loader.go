@@ -27,6 +27,8 @@ const (
 	RetryJob              ScriptName = "retryJob-11"
 	MoveToDelayed         ScriptName = "moveToDelayed-12"
 	MoveStalledJobsToWait ScriptName = "moveStalledJobsToWait-8"
+	AddJobScheduler       ScriptName = "addJobScheduler-11"
+	UpdateJobScheduler    ScriptName = "updateJobScheduler-12"
 )
 
 // Scripter executes vendored Lua scripts via EVALSHA, with transparent
@@ -64,6 +66,7 @@ func NewScripter(ctx context.Context, client redis.Scripter) (*Scripter, error) 
 		AddStandardJob, AddDelayedJob, AddPrioritizedJob,
 		MoveToActive, MoveToFinished, ExtendLock, ReleaseLock,
 		RetryJob, MoveToDelayed, MoveStalledJobsToWait,
+		AddJobScheduler, UpdateJobScheduler,
 	} {
 		if _, err := s.load(ctx, name); err != nil {
 			return nil, fmt.Errorf("preload %s: %w", name, err)
