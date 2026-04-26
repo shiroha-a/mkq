@@ -59,6 +59,15 @@ type Worker struct {
 	// the handler synchronously (one in-flight job per loop), this
 	// also covers handler completion — no separate WaitGroup needed.
 	run sync.WaitGroup
+
+	// stopOnce / stopDone make Stop idempotent: repeated Stop calls
+	// share the same waiter goroutine instead of spawning a new one
+	// per call. The single waiter still blocks on w.run.Wait() and
+	// exits once every dispatch loop / stalled-checker / in-flight
+	// handler has returned, bounding the post-Stop reachability of
+	// the Worker struct to handler-completion time.
+	stopOnce sync.Once
+	stopDone chan struct{}
 }
 
 // queueKeys is a snapshot of the per-queue Redis keys consumed by
@@ -108,6 +117,7 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 		rdb:       q.client.rdb,
 		runCtx:    ctx,
 		runCancel: cancel,
+		stopDone:  make(chan struct{}),
 	}
 
 	shim := newHandlerShim(h)
@@ -131,15 +141,20 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 // complete, Stop returns ctx.Err(); the still-running handlers see
 // their own ctx cancelled and any subsequent moveToFinished call may
 // fail with a lock-mismatch error (logged, not surfaced).
+//
+// Stop is idempotent: subsequent calls block on the same internal
+// channel as the first, so a graceful-stop helper invoked from
+// multiple sites won't spawn extra waiter goroutines.
 func (w *Worker) Stop(ctx context.Context) error {
-	w.runCancel()
-	loopDone := make(chan struct{})
-	go func() {
-		w.run.Wait()
-		close(loopDone)
-	}()
+	w.stopOnce.Do(func() {
+		w.runCancel()
+		go func() {
+			w.run.Wait()
+			close(w.stopDone)
+		}()
+	})
 	select {
-	case <-loopDone:
+	case <-w.stopDone:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -482,9 +497,10 @@ func (w *Worker) finishFailed(jobID, token string, opts jobOpts, reason, stacktr
 
 // runMoveToFinished is the shared moveToFinished invocation. extraFields
 // piggybacks on ARGV[9] for the failed path to write stacktrace
-// alongside the state change. keepCount is the per-target retention
-// (nil = keep all, *0 = remove immediately, *n>0 = keep last n).
-func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keepCount *int, target, msgProperty, msgValue string, extraFields []any) error {
+// alongside the state change. keep is the per-target retention
+// (nil = keep all, count==0 = remove immediately, count>0 = keep last
+// n; age trims by seconds since timestamp).
+func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *retentionLimit, target, msgProperty, msgValue string, extraFields []any) error {
 	now := time.Now().UnixMilli()
 
 	optsArgs := proto.MoveToFinishedOpts{
@@ -493,8 +509,12 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keepCount 
 		Attempts:     attempts,
 		Name:         w.cfg.workerName,
 	}
-	if keepCount != nil {
-		optsArgs.KeepJobs = &proto.KeepJobs{Count: *keepCount}
+	if keep != nil {
+		kj := &proto.KeepJobs{Count: keep.count}
+		if keep.ageSeconds != nil {
+			kj.Age = *keep.ageSeconds
+		}
+		optsArgs.KeepJobs = kj
 	}
 	optsBytes, err := proto.EncodeMoveToFinishedOpts(optsArgs)
 	if err != nil {
@@ -615,8 +635,15 @@ type jobOpts struct {
 	attempts         int
 	backoff          *BackoffStrategy
 	lifo             bool
-	removeOnComplete *int
-	removeOnFail     *int
+	removeOnComplete *retentionLimit
+	removeOnFail     *retentionLimit
+}
+
+// retentionLimit captures the count + age the worker needs to forward
+// into MoveToFinishedOpts.KeepJobs.
+type retentionLimit struct {
+	count      *int
+	ageSeconds *int
 }
 
 // parseJobOpts deserialises the BullMQ HASH `opts` JSON into the
@@ -662,16 +689,15 @@ func parseJobOpts(raw string) jobOpts {
 }
 
 // parseRemoveOpt converts a BullMQ removeOnComplete / removeOnFail
-// raw JSON value into the count form mkq cares about.
+// raw JSON value into the {count, age} pair mkq forwards into Lua.
 //
 //	null / missing / false   -> nil  (BullMQ default: keep all)
-//	true                     -> *int(0)  (remove on completion)
-//	number N                 -> *int(N)
-//	{"count": N, ...}        -> *int(N)  (age / limit ignored for now)
+//	true                     -> &{count: 0}  (remove on completion)
+//	number N                 -> &{count: N}
+//	{"count": C, "age": A}   -> &{count: C, age: A} (either field optional)
 //
-// Anything else is treated as "not understood" and returns nil so
-// retry / retention default cleanly.
-func parseRemoveOpt(raw json.RawMessage) *int {
+// Anything else is treated as "not understood" and returns nil.
+func parseRemoveOpt(raw json.RawMessage) *retentionLimit {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -681,17 +707,18 @@ func parseRemoveOpt(raw json.RawMessage) *int {
 		return nil
 	case "true":
 		v := 0
-		return &v
+		return &retentionLimit{count: &v}
 	}
 	var n int
 	if err := json.Unmarshal(raw, &n); err == nil {
-		return &n
+		return &retentionLimit{count: &n}
 	}
 	var obj struct {
 		Count *int `json:"count"`
+		Age   *int `json:"age"`
 	}
-	if err := json.Unmarshal(raw, &obj); err == nil && obj.Count != nil {
-		return obj.Count
+	if err := json.Unmarshal(raw, &obj); err == nil && (obj.Count != nil || obj.Age != nil) {
+		return &retentionLimit{count: obj.Count, ageSeconds: obj.Age}
 	}
 	return nil
 }

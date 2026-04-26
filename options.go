@@ -13,14 +13,16 @@ type queueConfig struct {
 }
 
 type addConfig struct {
-	jobID         string
-	delay         time.Duration
-	attempts      int
-	priority      uint32
-	lifo          bool
-	backoff       *BackoffStrategy
-	keepCompleted *int
-	keepFailed    *int
+	jobID            string
+	delay            time.Duration
+	attempts         int
+	priority         uint32
+	lifo             bool
+	backoff          *BackoffStrategy
+	keepCompleted    *int
+	keepFailed       *int
+	keepCompletedAge *time.Duration
+	keepFailedAge    *time.Duration
 }
 
 // WithJobID forces the job id instead of letting Redis INCR allocate
@@ -81,4 +83,21 @@ func WithKeepCompleted(n int) AddOption {
 // failure path.
 func WithKeepFailed(n int) AddOption {
 	return func(c *addConfig) { c.keepFailed = &n }
+}
+
+// WithKeepCompletedAge drops completed jobs older than age relative
+// to each subsequent finalisation tick. Mirrors BullMQ's
+// `removeOnComplete: { age: <seconds> }`. Resolution is one second;
+// sub-second values round to zero (no trim).
+//
+// Combine with WithKeepCompleted to cap by both count and age in
+// the same call (BullMQ's `{count, age}` shape).
+func WithKeepCompletedAge(age time.Duration) AddOption {
+	return func(c *addConfig) { c.keepCompletedAge = &age }
+}
+
+// WithKeepFailedAge is the failed-side analogue of
+// WithKeepCompletedAge.
+func WithKeepFailedAge(age time.Duration) AddOption {
+	return func(c *addConfig) { c.keepFailedAge = &age }
 }

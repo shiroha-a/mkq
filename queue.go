@@ -162,8 +162,8 @@ func toProtoOpts(cfg addConfig, delayMs int64) proto.AddOpts {
 		Priority:         cfg.priority,
 		Attempts:         cfg.attempts,
 		Lifo:             cfg.lifo,
-		RemoveOnComplete: cfg.keepCompleted,
-		RemoveOnFail:     cfg.keepFailed,
+		RemoveOnComplete: buildRetentionLimit(cfg.keepCompleted, cfg.keepCompletedAge),
+		RemoveOnFail:     buildRetentionLimit(cfg.keepFailed, cfg.keepFailedAge),
 	}
 	if cfg.backoff != nil {
 		o.Backoff = &proto.Backoff{
@@ -172,6 +172,23 @@ func toProtoOpts(cfg addConfig, delayMs int64) proto.AddOpts {
 		}
 	}
 	return o
+}
+
+// buildRetentionLimit folds the per-Add WithKeep* options into the
+// proto wire shape. nil result lets the encoder skip the key entirely.
+func buildRetentionLimit(count *int, age *time.Duration) *proto.RetentionLimit {
+	if count == nil && age == nil {
+		return nil
+	}
+	rl := &proto.RetentionLimit{Count: count}
+	if age != nil {
+		// 1-second resolution matches BullMQ. Sub-second values
+		// truncate; negatives are passed through to mirror BullMQ's
+		// "no validation" stance for `removeOnComplete: { age: -1 }`.
+		secs := int(age.Seconds())
+		rl.AgeSeconds = &secs
+	}
+	return rl
 }
 
 // parseAddResult coerces the polymorphic EVALSHA return into a job id

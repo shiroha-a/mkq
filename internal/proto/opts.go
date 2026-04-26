@@ -31,10 +31,24 @@ type AddOpts struct {
 	Lifo bool
 	// RemoveOnComplete / RemoveOnFail mirror BullMQ's per-job
 	// retention. nil means "not set" (BullMQ default = keep all).
-	// A non-nil value (including 0) is forwarded to Lua: 0 trims
-	// immediately, n>0 keeps the most recent n entries.
-	RemoveOnComplete *int
-	RemoveOnFail     *int
+	// A non-nil value with Count==nil && Age==nil emits an empty
+	// object — caller responsibility to use (nil) for that case.
+	RemoveOnComplete *RetentionLimit
+	RemoveOnFail     *RetentionLimit
+}
+
+// RetentionLimit is BullMQ's `removeOnComplete` / `removeOnFail`
+// value shape: optional Count + optional Age. The encoder picks the
+// number-shorthand wire form when only Count is set (matching what
+// BullMQ TS persists for `removeOnComplete: 5`) and the object form
+// `{count?, age?}` when Age is involved.
+type RetentionLimit struct {
+	// Count: 0 trims immediately, n>0 keeps the most recent n
+	// entries. nil omits the count field from the encoded value.
+	Count *int
+	// AgeSeconds drops entries older than this many seconds. nil
+	// omits the age field. BullMQ uses 1-second resolution.
+	AgeSeconds *int
 }
 
 // Backoff matches BullMQ's BackoffOptions shape ({type, delay}).
@@ -69,11 +83,33 @@ func EncodeAddOpts(o AddOpts) ([]byte, error) {
 	if o.Lifo {
 		m["lifo"] = true
 	}
-	if o.RemoveOnComplete != nil {
-		m["removeOnComplete"] = *o.RemoveOnComplete
+	if v := encodeRetentionLimit(o.RemoveOnComplete); v != nil {
+		m["removeOnComplete"] = v
 	}
-	if o.RemoveOnFail != nil {
-		m["removeOnFail"] = *o.RemoveOnFail
+	if v := encodeRetentionLimit(o.RemoveOnFail); v != nil {
+		m["removeOnFail"] = v
 	}
 	return msgpack.Marshal(m)
+}
+
+// encodeRetentionLimit picks the BullMQ wire shape: a bare number
+// when only Count is supplied (matching BullMQ TS's `removeOnComplete:
+// 5` persistence), or a `{count?, age?}` object when Age is involved.
+// Returns nil for fully-unset input so the encoder can omit the key.
+func encodeRetentionLimit(r *RetentionLimit) any {
+	if r == nil {
+		return nil
+	}
+	if r.AgeSeconds == nil {
+		if r.Count == nil {
+			return nil
+		}
+		return *r.Count
+	}
+	obj := map[string]any{}
+	if r.Count != nil {
+		obj["count"] = *r.Count
+	}
+	obj["age"] = *r.AgeSeconds
+	return obj
 }

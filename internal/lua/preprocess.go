@@ -20,7 +20,11 @@ import (
 	"strings"
 )
 
-//go:embed scripts/*.lua scripts/includes/*.lua
+// `all:scripts` walks the directory recursively and includes hidden
+// files, so any future re-vendoring that adds a deeper sub-directory
+// is picked up without touching this directive.
+//
+//go:embed all:scripts
 var scriptsFS embed.FS
 
 const scriptsRoot = "scripts"

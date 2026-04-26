@@ -11,14 +11,35 @@ import (
 // a foreign worker stored e.g. `removeOnComplete: true` — a wire
 // compatibility bug spotted in PR #15 review.
 
+// rlCount returns *limit.count or -1 when count is unset; -2 when the
+// whole limit is nil. Lets test assertions stay compact while still
+// distinguishing the three cases.
+func rlCount(r *retentionLimit) int {
+	if r == nil {
+		return -2
+	}
+	if r.count == nil {
+		return -1
+	}
+	return *r.count
+}
+
+// rlAge mirrors rlCount for the age field (seconds).
+func rlAge(r *retentionLimit) int {
+	if r == nil || r.ageSeconds == nil {
+		return -1
+	}
+	return *r.ageSeconds
+}
+
 func TestParseJobOpts_RemoveOnComplete_BooleanTrue(t *testing.T) {
 	t.Parallel()
 	got := parseJobOpts(`{"attempts":3,"removeOnComplete":true}`)
 	if got.attempts != 3 {
 		t.Errorf("attempts must survive boolean removeOnComplete, got %d", got.attempts)
 	}
-	if got.removeOnComplete == nil || *got.removeOnComplete != 0 {
-		t.Errorf("removeOnComplete=true should map to *int(0), got %v", got.removeOnComplete)
+	if c := rlCount(got.removeOnComplete); c != 0 {
+		t.Errorf("removeOnComplete=true should map to count=0, got %d", c)
 	}
 }
 
@@ -29,30 +50,44 @@ func TestParseJobOpts_RemoveOnComplete_BooleanFalse(t *testing.T) {
 		t.Errorf("attempts must survive boolean removeOnComplete, got %d", got.attempts)
 	}
 	if got.removeOnComplete != nil {
-		t.Errorf("removeOnComplete=false should map to nil, got %v", *got.removeOnComplete)
+		t.Errorf("removeOnComplete=false should map to nil, got %+v", got.removeOnComplete)
 	}
 }
 
 func TestParseJobOpts_RemoveOnComplete_Number(t *testing.T) {
 	t.Parallel()
 	got := parseJobOpts(`{"removeOnComplete":7}`)
-	if got.removeOnComplete == nil || *got.removeOnComplete != 7 {
-		t.Errorf("removeOnComplete=7 should map to *int(7), got %v", got.removeOnComplete)
+	if c := rlCount(got.removeOnComplete); c != 7 {
+		t.Errorf("removeOnComplete=7 should map to count=7, got %d", c)
 	}
 }
 
 func TestParseJobOpts_RemoveOnComplete_Object(t *testing.T) {
 	t.Parallel()
 	got := parseJobOpts(`{"removeOnComplete":{"count":42,"age":3600}}`)
-	if got.removeOnComplete == nil || *got.removeOnComplete != 42 {
-		t.Errorf("removeOnComplete={count:42} should map to *int(42), got %v", got.removeOnComplete)
+	if c := rlCount(got.removeOnComplete); c != 42 {
+		t.Errorf("removeOnComplete count: expected 42, got %d", c)
+	}
+	if a := rlAge(got.removeOnComplete); a != 3600 {
+		t.Errorf("removeOnComplete age: expected 3600, got %d", a)
+	}
+}
+
+func TestParseJobOpts_RemoveOnComplete_AgeOnlyObject(t *testing.T) {
+	t.Parallel()
+	got := parseJobOpts(`{"removeOnComplete":{"age":120}}`)
+	if c := rlCount(got.removeOnComplete); c != -1 {
+		t.Errorf("age-only removeOnComplete should leave count unset, got %d", c)
+	}
+	if a := rlAge(got.removeOnComplete); a != 120 {
+		t.Errorf("age-only removeOnComplete age: expected 120, got %d", a)
 	}
 }
 
 func TestParseJobOpts_RemoveOnFail_BooleanForms(t *testing.T) {
 	t.Parallel()
-	if got := parseJobOpts(`{"removeOnFail":true}`); got.removeOnFail == nil || *got.removeOnFail != 0 {
-		t.Errorf("removeOnFail=true should map to *int(0), got %v", got.removeOnFail)
+	if got := parseJobOpts(`{"removeOnFail":true}`); rlCount(got.removeOnFail) != 0 {
+		t.Errorf("removeOnFail=true should map to count=0")
 	}
 	if got := parseJobOpts(`{"removeOnFail":false}`); got.removeOnFail != nil {
 		t.Errorf("removeOnFail=false should map to nil")
@@ -103,11 +138,11 @@ func TestParseJobOpts_AllForeignFieldsTogether(t *testing.T) {
 	if got.backoff == nil || got.backoff.Type != "fixed" || got.backoff.Delay != time.Second {
 		t.Errorf("backoff: %+v", got.backoff)
 	}
-	if got.removeOnComplete == nil || *got.removeOnComplete != 0 {
-		t.Errorf("removeOnComplete: %v", got.removeOnComplete)
+	if c := rlCount(got.removeOnComplete); c != 0 {
+		t.Errorf("removeOnComplete count: expected 0, got %d", c)
 	}
-	if got.removeOnFail == nil || *got.removeOnFail != 10 {
-		t.Errorf("removeOnFail: %v", got.removeOnFail)
+	if c := rlCount(got.removeOnFail); c != 10 {
+		t.Errorf("removeOnFail count: expected 10, got %d", c)
 	}
 }
 
@@ -119,10 +154,10 @@ func TestParseJobOpts_GarbageRemoveOpt(t *testing.T) {
 		t.Errorf("attempts must survive garbage removeOn*, got %d", got.attempts)
 	}
 	if got.removeOnComplete != nil {
-		t.Errorf("garbage string should yield nil, got %v", *got.removeOnComplete)
+		t.Errorf("garbage string should yield nil, got %+v", got.removeOnComplete)
 	}
 	if got.removeOnFail != nil {
-		t.Errorf("garbage array should yield nil, got %v", *got.removeOnFail)
+		t.Errorf("garbage array should yield nil, got %+v", got.removeOnFail)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 )
 
 // ScriptName identifies a vendored entry-point script.
@@ -37,6 +38,13 @@ type Scripter struct {
 
 	mu      sync.RWMutex
 	scripts map[ScriptName]*loadedScript
+
+	// loadGroup deduplicates concurrent SCRIPT LOAD calls for the
+	// same script name. Without it, N goroutines that simultaneously
+	// observe NOSCRIPT after a Redis flush would each issue their
+	// own SCRIPT LOAD round-trip; singleflight collapses them into
+	// one upload, with the rest waiting on the shared result.
+	loadGroup singleflight.Group
 }
 
 type loadedScript struct {
@@ -98,19 +106,29 @@ func (s *Scripter) get(name ScriptName) (*loadedScript, error) {
 }
 
 func (s *Scripter) load(ctx context.Context, name ScriptName) (*loadedScript, error) {
-	src, err := Preprocess(string(name))
+	// singleflight collapses concurrent reloads for the same script
+	// into a single SCRIPT LOAD round-trip; competing goroutines wait
+	// on the shared result. The key is the script name so distinct
+	// scripts can still load in parallel.
+	v, err, _ := s.loadGroup.Do(string(name), func() (any, error) {
+		src, err := Preprocess(string(name))
+		if err != nil {
+			return nil, err
+		}
+		sha, err := s.client.ScriptLoad(ctx, src).Result()
+		if err != nil {
+			return nil, fmt.Errorf("script load %s: %w", name, err)
+		}
+		ls := &loadedScript{source: src, sha: sha}
+		s.mu.Lock()
+		s.scripts[name] = ls
+		s.mu.Unlock()
+		return ls, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	sha, err := s.client.ScriptLoad(ctx, src).Result()
-	if err != nil {
-		return nil, fmt.Errorf("script load %s: %w", name, err)
-	}
-	ls := &loadedScript{source: src, sha: sha}
-	s.mu.Lock()
-	s.scripts[name] = ls
-	s.mu.Unlock()
-	return ls, nil
+	return v.(*loadedScript), nil
 }
 
 func isNoScript(err error) bool {

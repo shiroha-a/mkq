@@ -30,12 +30,17 @@ type MoveToFinishedOpts struct {
 	Name     string
 }
 
-// KeepJobs mirrors BullMQ's keepJobs option. Either Count or Age can
-// be set; both forms supported by storeAndEnqueueJob etc.
+// KeepJobs mirrors BullMQ's keepJobs option. Either field can be set;
+// both forms are supported by storeAndEnqueueJob etc. Pointers
+// distinguish "unset" from "explicitly zero" — the Lua treats
+// keepJobs.count==0 as "remove immediately", so an age-only caller
+// must NOT default-initialise count.
 type KeepJobs struct {
-	// Count keeps at most N completed/failed jobs.
-	Count int
-	// Age (seconds) drops jobs older than this from the set.
+	// Count: nil = unbounded; *0 = remove immediately; *n>0 = keep
+	// the most recent n entries via removeJobsByMaxCount.
+	Count *int
+	// Age (seconds) drops jobs older than this from the set on every
+	// finalisation tick. 0 / nil disables age trimming.
 	Age int
 }
 
@@ -54,10 +59,13 @@ type KeepJobs struct {
 func EncodeMoveToFinishedOpts(o MoveToFinishedOpts) ([]byte, error) {
 	keep := map[string]any{}
 	if o.KeepJobs != nil {
-		// 0 is meaningful for Count: BullMQの「即時削除」セマンティクス
-		// に対応するため、Count==0 でも emit する。一方 Age はBullMQが
-		// 0 を「制限なし」(=未設定) として扱うので omit でよい。
-		keep["count"] = o.KeepJobs.Count
+		// Count==nil omits the count key, leaving Lua's
+		// `opts['keepJobs']['count']` as nil (treated as unbounded).
+		// Count==*0 explicitly emits 0 (BullMQの「即時削除」). Age
+		// is omitted when zero because BullMQ treats 0 as unset.
+		if o.KeepJobs.Count != nil {
+			keep["count"] = *o.KeepJobs.Count
+		}
 		if o.KeepJobs.Age > 0 {
 			keep["age"] = o.KeepJobs.Age
 		}
