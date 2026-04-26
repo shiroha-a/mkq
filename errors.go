@@ -22,3 +22,9 @@ var ErrPriorityWithDelay = errors.New("mkq: WithPriority cannot be combined with
 //
 //	return fmt.Errorf("invalid input: %w", mkq.ErrUnrecoverable)
 var ErrUnrecoverable = errors.New("mkq: unrecoverable error (skip retry)")
+
+// ErrJobNotFound is returned by Queue.Get when the HASH at the
+// expected key is missing — the job either never existed, was
+// removed via WithKeepCompleted(0), or expired from a separate
+// retention policy.
+var ErrJobNotFound = errors.New("mkq: job not found")
