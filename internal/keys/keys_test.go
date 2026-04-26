@@ -19,6 +19,7 @@ func TestBuilder_BullMQLayout(t *testing.T) {
 		{"failed", New("bull", "deliver").Failed(), "bull:deliver:failed"},
 		{"paused", New("bull", "deliver").Paused(), "bull:deliver:paused"},
 		{"stalled", New("bull", "deliver").Stalled(), "bull:deliver:stalled"},
+		{"stalled-check", New("bull", "deliver").StalledCheck(), "bull:deliver:stalled-check"},
 		{"meta", New("bull", "deliver").Meta(), "bull:deliver:meta"},
 		{"id", New("bull", "deliver").ID(), "bull:deliver:id"},
 		{"marker", New("bull", "deliver").Marker(), "bull:deliver:marker"},

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/shiroha-a/mkq/internal/lua"
 	"github.com/shiroha-a/mkq/internal/proto"
@@ -46,6 +47,7 @@ type Worker struct {
 	cfg     workerConfig
 	keys    queueKeys
 	scripts *lua.Scripter
+	rdb     redis.UniversalClient
 
 	// runCtx is cancelled by Stop to break dispatch goroutines out of
 	// the dequeue loop. Each in-flight handler derives its job ctx
@@ -66,6 +68,7 @@ type queueKeys struct {
 	wait, active, prioritized, events, stalled string
 	limiter, delayed, paused, meta, pc, marker string
 	completed, failed                          string
+	stalledCheck                               string
 	prefix                                     string
 }
 
@@ -84,6 +87,8 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 		concurrency:      defaultConcurrency,
 		lockDuration:     defaultLockDuration,
 		idlePollInterval: defaultIdlePollInterval,
+		stalledInterval:  defaultStalledInterval,
+		maxStalledCount:  defaultMaxStalledCount,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -100,6 +105,7 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 		cfg:       cfg,
 		keys:      newQueueKeys(q),
 		scripts:   q.client.scripts,
+		rdb:       q.client.rdb,
 		runCtx:    ctx,
 		runCancel: cancel,
 	}
@@ -109,6 +115,14 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 		w.run.Add(1)
 		go w.dispatchLoop(shim)
 	}
+
+	// Single stalled-checker per Worker. The Lua's stalled-check key
+	// TTL serialises concurrent workers automatically.
+	if cfg.stalledInterval > 0 {
+		w.run.Add(1)
+		go w.stalledLoop()
+	}
+
 	return w, nil
 }
 
@@ -163,6 +177,48 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 	}
 }
 
+// stalledLoop fires moveStalledJobsToWait at the configured interval.
+// One goroutine per Worker; concurrent workers serialise via the
+// Lua's stalled-check key TTL.
+func (w *Worker) stalledLoop() {
+	defer w.run.Done()
+	t := time.NewTicker(w.cfg.stalledInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.runCtx.Done():
+			return
+		case <-t.C:
+			if err := w.runStalledCheck(); err != nil {
+				// Best-effort: a single tick's failure is recoverable
+				// (next tick will try again). Surface via observability
+				// when that lands.
+				continue
+			}
+		}
+	}
+}
+
+// runStalledCheck invokes moveStalledJobsToWait once.
+func (w *Worker) runStalledCheck() error {
+	now := time.Now().UnixMilli()
+	maxCheckMs := w.cfg.stalledInterval.Milliseconds()
+	keys := w.keys.moveStalledKeys()
+	_, err := w.scripts.Run(
+		w.runCtx,
+		lua.MoveStalledJobsToWait,
+		keys,
+		w.cfg.maxStalledCount,
+		w.keys.prefix,
+		now,
+		maxCheckMs,
+	)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("moveStalledJobsToWait: %w", err)
+	}
+	return nil
+}
+
 // tryOnce performs one dequeue attempt and, if successful, runs the
 // handler and finalises the job. Returns (processed, err).
 func (w *Worker) tryOnce(handlerAny any) (bool, error) {
@@ -199,6 +255,28 @@ func (w *Worker) tryOnce(handlerAny any) (bool, error) {
 	}
 	if !ok {
 		return false, nil
+	}
+
+	// `defa` (default failed reason) is set by moveStalledJobsToWait
+	// when a job has been reclaimed more than maxStalledCount times.
+	// BullMQ's worker contract is to skip the handler and finalise
+	// straight to failed; running the handler again would re-stall
+	// the job in an infinite loop. moveToFinished's failed branch
+	// HDELs the field so a re-acquired but recovered job won't
+	// short-circuit on stale state.
+	if defa, hasDefa := jobMap["defa"]; hasDefa && defa != "" {
+		jobOpts := parseJobOpts(jobMap["opts"])
+		if err := w.finishFailed(jobID, token, jobOpts, defa, mustJSONString([]string{defa})); err != nil {
+			// Best-effort lock cleanup matches the processJob path.
+			_, _ = w.scripts.Run(
+				context.Background(),
+				lua.ReleaseLock,
+				[]string{w.keys.jobLock(jobID)},
+				token,
+				w.cfg.lockDuration.Milliseconds(),
+			)
+		}
+		return true, nil
 	}
 
 	w.processJob(handlerAny, token, jobID, jobMap)
@@ -336,14 +414,12 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 		return w.finishCompleted(jobID, token, jobOpts, out.returnValue)
 	}
 
-	// Decide retry. Reading from the in-memory jobMap snapshot is fine
-	// for attempts/backoff (immutable), but `atm` lives in Redis and
-	// may have been bumped by a prior retry on a different worker —
-	// we re-read it (via jobMap, which is the HGETALL captured at
-	// moveToActive). For BullMQ-correctness this is sufficient because
-	// stalled-recovery — the only way `atm` advances without us
-	// observing it — is not yet implemented (tracked in #13).
-	atm := parseInt(jobMap["atm"])
+	// Re-read atm from Redis instead of trusting the moveToActive
+	// snapshot. BullMQ's current stalled-recovery doesn't bump atm
+	// (only stc), so the snapshot would be correct today, but a
+	// fresh HGET removes the dependency on that invariant and keeps
+	// the retry decision robust if BullMQ semantics shift later.
+	atm := w.fetchAtm(jobID, jobMap)
 
 	if !w.shouldRetry(jobOpts, atm, out.err) {
 		return w.finishFailed(jobID, token, jobOpts, out.errReason, out.stacktrace)
@@ -635,6 +711,22 @@ func (w *Worker) shouldRetry(o jobOpts, attemptsMade int, err error) bool {
 	return attemptsMade+1 < o.attempts
 }
 
+// fetchAtm reads the most recent attempts-made counter from Redis,
+// falling back to the moveToActive snapshot if the HGET fails. This
+// closes the small race window where another worker / stalled
+// recovery could have advanced atm between dequeue and finalise.
+func (w *Worker) fetchAtm(jobID string, jobMap map[string]string) int {
+	// Use a short-lived ctx independent of runCtx so that worker
+	// shutdown doesn't cause us to under-count and bypass retries.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	v, err := w.rdb.HGet(ctx, w.keys.job(jobID), "atm").Result()
+	if err != nil {
+		return parseInt(jobMap["atm"])
+	}
+	return parseInt(v)
+}
+
 func parseInt(s string) int {
 	if s == "" {
 		return 0
@@ -757,20 +849,21 @@ func defaultWorkerName() string {
 func newQueueKeys[T any](q *Queue[T]) queueKeys {
 	b := q.keys
 	return queueKeys{
-		wait:        b.Wait(),
-		active:      b.Active(),
-		prioritized: b.Prioritized(),
-		events:      b.Events(),
-		stalled:     b.Stalled(),
-		limiter:     b.Limiter(),
-		delayed:     b.Delayed(),
-		paused:      b.Paused(),
-		meta:        b.Meta(),
-		pc:          b.PriorityCounter(),
-		marker:      b.Marker(),
-		completed:   b.Completed(),
-		failed:      b.Failed(),
-		prefix:      b.Base(),
+		wait:         b.Wait(),
+		active:       b.Active(),
+		prioritized:  b.Prioritized(),
+		events:       b.Events(),
+		stalled:      b.Stalled(),
+		limiter:      b.Limiter(),
+		delayed:      b.Delayed(),
+		paused:       b.Paused(),
+		meta:         b.Meta(),
+		pc:           b.PriorityCounter(),
+		marker:       b.Marker(),
+		completed:    b.Completed(),
+		failed:       b.Failed(),
+		stalledCheck: b.StalledCheck(),
+		prefix:       b.Base(),
 	}
 }
 
@@ -817,6 +910,18 @@ func (k queueKeys) retryJobKeys(jobID string) []string {
 	return []string{
 		k.active, k.wait, k.paused, k.job(jobID), k.meta, k.events,
 		k.delayed, k.prioritized, k.pc, k.marker, k.stalled,
+	}
+}
+
+// moveStalledKeys assembles KEYS[1..8] for moveStalledJobsToWait-8.lua.
+//
+//	KEYS[1] stalled SET   KEYS[2] wait LIST    KEYS[3] active LIST
+//	KEYS[4] stalled-check KEYS[5] meta         KEYS[6] paused
+//	KEYS[7] marker        KEYS[8] events stream
+func (k queueKeys) moveStalledKeys() []string {
+	return []string{
+		k.stalled, k.wait, k.active, k.stalledCheck, k.meta,
+		k.paused, k.marker, k.events,
 	}
 }
 
