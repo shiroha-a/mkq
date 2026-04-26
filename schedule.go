@@ -114,6 +114,20 @@ func (q *Queue[T]) UpsertScheduleEvery(
 		scheduleOpts.EndDate = cfg.endDate.UnixMilli()
 	}
 
+	// every-mode の初回 fire は max(startDate, now)。lua の
+	// getJobSchedulerEveryNextMillis と同じ式を Go 側で再現し、
+	// firstFire > endDate なら dead schedule を作らずに reject。
+	// pattern-mode 側 (UpsertSchedulePattern) と同じ gating ポリシー。
+	if !cfg.endDate.IsZero() {
+		firstFire := time.Now()
+		if !cfg.startDate.IsZero() && cfg.startDate.After(firstFire) {
+			firstFire = cfg.startDate
+		}
+		if firstFire.After(cfg.endDate) {
+			return fmt.Errorf("mkq: first fire %v exceeds endDate %v; schedule would never run", firstFire, cfg.endDate)
+		}
+	}
+
 	// every-mode は ARGV[1]="0" → lua が getJobSchedulerEveryNextMillis
 	// で次 millis を再計算する。
 	return q.upsertSchedule(ctx, scheduleID, "0", scheduleOpts, string(dataJSON))
@@ -187,6 +201,13 @@ func (q *Queue[T]) UpsertSchedulePattern(
 		firstFire = cc.nextFire(cfg.startDate)
 	default:
 		firstFire = cc.nextFire(now)
+	}
+	// endDate を超えた firstFire を許すと、yearly cron + endDate=24h の
+	// ように lua 側で月単位の delay job を作ってしまう。worker の
+	// rescheduleNext が以後の iteration を gate するのと同じロジックを
+	// 初回 upsert にも適用し、dead schedule の作成を未然に弾く。
+	if !cfg.endDate.IsZero() && firstFire.After(cfg.endDate) {
+		return fmt.Errorf("mkq: first fire %v exceeds endDate %v; schedule would never run", firstFire, cfg.endDate)
 	}
 	nextMillis := strconv.FormatInt(firstFire.UnixMilli(), 10)
 

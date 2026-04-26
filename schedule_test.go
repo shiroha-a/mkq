@@ -134,6 +134,58 @@ func TestSchedule_EndDateStops(t *testing.T) {
 		"endDate must allow at least the initial iterations to fire")
 }
 
+// TestScheduleEvery_RejectsEndDateInPast pins the initial-upsert
+// endDate guard for every-mode: passing an endDate that has already
+// passed (or one that's earlier than startDate) means the schedule
+// could never fire even once, so the upsert returns an error rather
+// than persisting a dead schedule HASH.
+func TestScheduleEvery_RejectsEndDateInPast(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "tick")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	t.Run("endDate in past", func(t *testing.T) {
+		err := queue.UpsertScheduleEvery(ctx, "x", time.Second, testPayload{},
+			mkq.WithScheduleEndDate(time.Now().Add(-time.Hour)),
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "endDate")
+	})
+	t.Run("startDate after endDate", func(t *testing.T) {
+		err := queue.UpsertScheduleEvery(ctx, "x", time.Second, testPayload{},
+			mkq.WithScheduleStartDate(time.Now().Add(time.Hour)),
+			mkq.WithScheduleEndDate(time.Now().Add(time.Minute)),
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "endDate")
+	})
+}
+
+// TestSchedulePattern_RejectsFirstFireBeyondEndDate pins the
+// equivalent guard for pattern-mode: a yearly cron with endDate=24h
+// would compute firstFire as next Jan 1st (months out), creating a
+// "dead" delayed job. The upsert call rejects it instead.
+func TestSchedulePattern_RejectsFirstFireBeyondEndDate(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "tick")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := queue.UpsertSchedulePattern(ctx,
+		"yearly", "0 0 1 1 *", testPayload{},
+		mkq.WithScheduleEndDate(time.Now().Add(24*time.Hour)),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "endDate")
+}
+
 // TestSchedule_RemoveStops confirms that RemoveSchedule prevents
 // further iterations: the in-flight job (if any) finishes normally and
 // the worker's re-upsert path no-ops because the schedule HASH is gone.
