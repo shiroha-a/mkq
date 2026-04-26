@@ -42,6 +42,13 @@ type Job[T any] struct {
 	// ProcessedBy is BullMQ `pb` — the worker name that most recently
 	// dequeued this job (set by prepareJobForProcessing.lua).
 	ProcessedBy string
+
+	// queue is set when the Job is constructed via a Queue path
+	// (Add / Get / handler dispatch), enabling the mutation methods
+	// (UpdateProgress / UpdateData / Log) without forcing callers to
+	// thread the queue separately. Stays nil for synthetic Jobs
+	// constructed by tests; methods then return ErrJobDetached.
+	queue *Queue[T]
 }
 
 // JobState is the post-finalisation read-only snapshot of a job's

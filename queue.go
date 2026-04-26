@@ -113,6 +113,7 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 		Name:      q.name,
 		Data:      payload,
 		Timestamp: time.UnixMilli(timestampMs),
+		queue:     q,
 	}, nil
 }
 
@@ -229,6 +230,7 @@ func (q *Queue[T]) Get(ctx context.Context, jobID string) (*Job[T], *JobState, e
 	if err != nil {
 		return nil, nil, err
 	}
+	job.queue = q
 	return job, buildJobState(hash), nil
 }
 

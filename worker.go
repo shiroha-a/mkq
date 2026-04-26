@@ -126,7 +126,7 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 		stopDone:  make(chan struct{}),
 	}
 
-	shim := newHandlerShim(h)
+	shim := newHandlerShim(q, h)
 	for i := 0; i < cfg.concurrency; i++ {
 		w.run.Add(1)
 		go w.dispatchLoop(shim)
@@ -948,13 +948,17 @@ func invokeHandler(ctx context.Context, handlerAny any, jobID string, jobMap map
 
 // newHandlerShim wraps a typed Handler[T] in the type-erased adapter
 // the Worker invokes. Lives here so worker.go owns the only place that
-// reaches into Job[T] reconstruction.
-func newHandlerShim[T any](h Handler[T]) any {
+// reaches into Job[T] reconstruction. The Queue[T] back-pointer is
+// stitched into every reconstructed Job[T] so handler-side mutation
+// methods (Job.UpdateProgress / Job.UpdateData / Job.Log) work
+// without forcing handlers to capture the queue separately.
+func newHandlerShim[T any](q *Queue[T], h Handler[T]) any {
 	return func(ctx context.Context, jobID string, jobMap map[string]string) (any, error) {
 		job, err := buildJob[T](jobID, jobMap)
 		if err != nil {
 			return nil, fmt.Errorf("mkq: rebuild job %s: %w", jobID, err)
 		}
+		job.queue = q
 		return h(ctx, job)
 	}
 }
