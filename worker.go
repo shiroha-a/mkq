@@ -257,6 +257,28 @@ func (w *Worker) tryOnce(handlerAny any) (bool, error) {
 		return false, nil
 	}
 
+	// `defa` (default failed reason) is set by moveStalledJobsToWait
+	// when a job has been reclaimed more than maxStalledCount times.
+	// BullMQ's worker contract is to skip the handler and finalise
+	// straight to failed; running the handler again would re-stall
+	// the job in an infinite loop. moveToFinished's failed branch
+	// HDELs the field so a re-acquired but recovered job won't
+	// short-circuit on stale state.
+	if defa, hasDefa := jobMap["defa"]; hasDefa && defa != "" {
+		jobOpts := parseJobOpts(jobMap["opts"])
+		if err := w.finishFailed(jobID, token, jobOpts, defa, mustJSONString([]string{defa})); err != nil {
+			// Best-effort lock cleanup matches the processJob path.
+			_, _ = w.scripts.Run(
+				context.Background(),
+				lua.ReleaseLock,
+				[]string{w.keys.jobLock(jobID)},
+				token,
+				w.cfg.lockDuration.Milliseconds(),
+			)
+		}
+		return true, nil
+	}
+
 	w.processJob(handlerAny, token, jobID, jobMap)
 	return true, nil
 }

@@ -30,23 +30,24 @@ func TestWorker_Stalled_RecoversFromDeadWorker(t *testing.T) {
 	job, err := queue.Add(ctx, testPayload{Inbox: "stalled"})
 	require.NoError(t, err)
 
-	// "Dead" worker: short lock + handler that never returns. The
-	// handler ctx will be cancelled by either heartbeat-failure or
-	// Worker.Stop, but importantly its lock token will not be
-	// renewed past lockDuration.
+	// "Dead" worker simulation: the handler enters but does NOT
+	// watch ctx, so the dispatch loop stays blocked inside the
+	// handler. This prevents the dead worker from re-acquiring the
+	// job after stalled detection moves it back to wait — the
+	// realistic equivalent of a worker process that's been killed
+	// or has lost its Redis connection. Sub-second lockDuration
+	// guarantees the lock TTL expires before the heartbeat clamp
+	// (>= 1s) can renew it.
 	deadHandlerEntered := make(chan struct{}, 1)
-	deadWorker, err := mkq.Process(queue, func(ctx context.Context, _ *mkq.Job[testPayload]) (any, error) {
+	deadHandlerRelease := make(chan struct{})
+	deadWorker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
 		select {
 		case deadHandlerEntered <- struct{}{}:
 		default:
 		}
-		<-ctx.Done()
-		return nil, ctx.Err()
+		<-deadHandlerRelease
+		return nil, nil
 	},
-		// Heartbeat clamps to >= 1s, so a sub-second lockDuration
-		// guarantees the lock TTL expires before the heartbeat ever
-		// fires — mimicking a worker that lost its Redis connection
-		// while still owning the active-list slot.
 		mkq.WithLockDuration(400*time.Millisecond),
 		mkq.WithIdlePollInterval(20*time.Millisecond),
 		// Disable stalled detection on the dead worker so it can't
@@ -54,6 +55,14 @@ func TestWorker_Stalled_RecoversFromDeadWorker(t *testing.T) {
 		mkq.WithStalledInterval(0),
 	)
 	require.NoError(t, err)
+	defer func() {
+		// Release the dead handler so Worker.Stop can drain. Use a
+		// bounded ctx so Stop never hangs the test.
+		close(deadHandlerRelease)
+		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = deadWorker.Stop(stopCtx)
+	}()
 
 	// Wait until the dead worker has the job in active.
 	receiveOrFail(t, ctx, deadHandlerEntered)
@@ -66,16 +75,15 @@ func TestWorker_Stalled_RecoversFromDeadWorker(t *testing.T) {
 	},
 		mkq.WithLockDuration(5*time.Second),
 		mkq.WithIdlePollInterval(20*time.Millisecond),
-		mkq.WithStalledInterval(500*time.Millisecond),
+		mkq.WithStalledInterval(300*time.Millisecond),
 	)
 	require.NoError(t, err)
 	defer liveWorker.Stop(context.Background())
-	defer deadWorker.Stop(context.Background())
 
 	// Stalled detection in BullMQ requires two ticks: the first
 	// adds the dead worker's active job to the stalled SET, the
 	// second observes the missing lock and re-enqueues. Plus the
-	// 2s lockDuration must elapse. Allow a generous wait.
+	// 400ms lockDuration must elapse. Allow a generous wait.
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
 	waitFor(t, ctx, 100*time.Millisecond, func() bool {
@@ -131,15 +139,23 @@ func TestWorker_Stalled_FailsAfterMaxStalledCount(t *testing.T) {
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
-	waitFor(t, ctx, 200*time.Millisecond, func() bool {
-		defa, _ := rdb.HGet(ctx, base+job.ID, "defa").Result()
-		return defa != ""
-	})
 
-	defa, err := rdb.HGet(ctx, base+job.ID, "defa").Result()
-	require.NoError(t, err)
-	assert.Equal(t, "job stalled more than allowable limit", defa,
-		"BullMQ's canonical default-failed message must be set")
+	// Final state assertion: a worker re-acquires the stalled-too-many
+	// job via moveToActive, observes BullMQ's `defa` HASH field, and
+	// finalises straight to failed (skipping the handler). The
+	// failed-branch Lua then HDELs `defa`, so by the time we observe
+	// the failed ZSET membership, only `failedReason` survives. We
+	// don't try to catch the transient `defa` snapshot — the worker's
+	// dequeue loop is too fast to make that observable race-free.
+	waitFor(t, ctx, 100*time.Millisecond, func() bool {
+		v, _ := rdb.ZScore(ctx, base+"failed", job.ID).Result()
+		return v > 0
+	})
+	failedReason, _ := rdb.HGet(ctx, base+job.ID, "failedReason").Result()
+	assert.Equal(t, "job stalled more than allowable limit", failedReason,
+		"defa must be persisted as failedReason on the terminal failed state")
+	finalDefa, _ := rdb.HGet(ctx, base+job.ID, "defa").Result()
+	assert.Empty(t, finalDefa, "moveToFinished failed must HDEL defa")
 }
 
 // TestWorker_Stalled_HealthyWorkerNeverStalls regression-pins that a
