@@ -19,9 +19,25 @@ import (
 
 // Handler is the user function invoked once per dequeued job. The
 // returned value (any) is JSON-encoded and stored in the BullMQ
-// `returnvalue` HASH field on success. A non-nil error transitions the
-// job to failed; mkq's first worker PR does not yet retry, regardless
-// of WithAttempts.
+// `returnvalue` HASH field on success.
+//
+// A non-nil error transitions the job to retry or failed depending on
+// the job's WithAttempts / WithBackoff configuration. Wrapping the
+// returned error with ErrUnrecoverable forces the failed transition
+// regardless of remaining attempts.
+//
+// Notes mirroring BullMQ behaviour:
+//   - Panics inside the handler are recovered, recorded in the
+//     stacktrace HASH field, and treated as a regular error — they
+//     are eligible for retry under WithAttempts. Use
+//     ErrUnrecoverable inside an explicit recover() if you need
+//     panics to be terminal.
+//   - The `retries-exhausted` event in the BullMQ events stream
+//     fires whenever a job lands in `failed` and `attemptsMade`
+//     reached the configured `attempts`. With the default (no
+//     WithAttempts), `attempts` is 0 and any failure satisfies the
+//     gate, so the event fires immediately. This matches BullMQ TS
+//     wire-format behaviour.
 type Handler[T any] func(ctx context.Context, job *Job[T]) (any, error)
 
 // Worker is the lifecycle handle returned by Process. It owns its
@@ -190,7 +206,8 @@ func (w *Worker) tryOnce(handlerAny any) (bool, error) {
 }
 
 // processJob runs the handler for one acquired job, manages the lock
-// heartbeat, and writes the terminal state via moveToFinished.
+// heartbeat, and writes the terminal state via the appropriate
+// BullMQ Lua script (moveToFinished / retryJob / moveToDelayed).
 //
 // The per-job ctx is derived from runCtx so worker shutdown propagates
 // without a separate bridge goroutine. Heartbeat owns its own goroutine
@@ -203,15 +220,15 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 	hbDone := make(chan struct{})
 	go w.heartbeat(jobCtx, hbDone, token, jobID, cancelJob)
 
-	target, msgProperty, msgValue := w.runHandler(jobCtx, handlerAny, jobID, jobMap)
+	outcome := w.runHandler(jobCtx, handlerAny, jobID, jobMap)
 
-	// Heartbeat must finish before moveToFinished so its extendLock
-	// won't race with moveToFinished's lock-token validation.
+	// Heartbeat must finish before any finalisation Lua call so its
+	// extendLock won't race with the script's lock-token validation.
 	cancelJob()
 	<-hbDone
 
-	if err := w.finish(jobID, token, target, msgProperty, msgValue); err != nil {
-		// Best-effort lock cleanup so a failed moveToFinished doesn't
+	if err := w.finalise(jobID, token, jobMap, outcome); err != nil {
+		// Best-effort lock cleanup so a failed terminal call doesn't
 		// strand the lock for the full TTL.
 		_, _ = w.scripts.Run(
 			context.Background(),
@@ -223,31 +240,55 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 	}
 }
 
-// runHandler invokes the user handler with panic recovery and returns
-// the wire-level finish parameters: target ("completed" or "failed"),
-// the BullMQ msg field name, and the value to write.
+// handlerOutcome captures the result of invoking a handler. Exactly
+// one of returnValue / errReason is populated. stacktrace mirrors
+// BullMQ's HASH `stacktrace` JSON-array shape and is set on every
+// failure (panics include the captured Go stack; plain errors carry
+// the message itself).
+type handlerOutcome struct {
+	success     bool
+	returnValue string // JSON-encoded user return, success=true only
+	err         error  // raw error from the handler, success=false only
+	errReason   string // BullMQ failedReason (plain string)
+	stacktrace  string // BullMQ stacktrace (JSON array string)
+}
+
+// runHandler invokes the user handler under panic recovery and returns
+// the BullMQ-shaped wire fields. BullMQ's wire format is asymmetric:
 //
-// BullMQ's wire format is asymmetric:
-//   - returnvalue is JSON.stringify-d (the user's return is opaque).
+//   - returnvalue is JSON.stringify-d (opaque user return).
 //   - failedReason is the raw err.message string (no JSON quoting).
+//   - stacktrace is JSON.stringify of an array of strings.
 //
 // Mirroring that asymmetry is required for bull-board and other
-// foreign readers to render error messages without spurious quotes.
-func (w *Worker) runHandler(ctx context.Context, handlerAny any, jobID string, jobMap map[string]string) (target, msgProperty, msgValue string) {
+// foreign readers to render values without spurious quotes.
+func (w *Worker) runHandler(ctx context.Context, handlerAny any, jobID string, jobMap map[string]string) (out handlerOutcome) {
 	defer func() {
 		if r := recover(); r != nil {
-			target = "failed"
-			msgProperty = "failedReason"
 			stack := string(debug.Stack())
-			msgValue = fmt.Sprintf("panic: %v\n%s", r, stack)
+			reason := fmt.Sprintf("panic: %v\n%s", r, stack)
+			out = handlerOutcome{
+				success:    false,
+				err:        fmt.Errorf("mkq: handler panic: %v", r),
+				errReason:  reason,
+				stacktrace: mustJSONString([]string{reason}),
+			}
 		}
 	}()
 
 	ret, err := invokeHandler(ctx, handlerAny, jobID, jobMap)
 	if err != nil {
-		return "failed", "failedReason", err.Error()
+		return handlerOutcome{
+			success:    false,
+			err:        err,
+			errReason:  err.Error(),
+			stacktrace: mustJSONString([]string{err.Error()}),
+		}
 	}
-	return "completed", "returnvalue", mustJSONString(ret)
+	return handlerOutcome{
+		success:     true,
+		returnValue: mustJSONString(ret),
+	}
 }
 
 // heartbeat extends the job's lock at lockDuration/2 intervals until
@@ -282,20 +323,75 @@ func (w *Worker) heartbeat(ctx context.Context, done chan<- struct{}, token, job
 	}
 }
 
-// finish runs moveToFinished for the given target + payload.
-func (w *Worker) finish(jobID, token, target, msgProperty, msgValue string) error {
+// finalise dispatches the terminal-state Lua call for a job. On
+// success it always calls moveToFinished("completed"). On failure it
+// consults retry policy and may instead call retryJob (immediate
+// re-enqueue) or moveToDelayed (backoff-delayed re-enqueue), bumping
+// the BullMQ HASH `atm` (attempts made) counter atomically inside
+// the script.
+func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out handlerOutcome) error {
+	jobOpts := parseJobOpts(jobMap["opts"])
+
+	if out.success {
+		return w.finishCompleted(jobID, token, jobOpts.attempts, out.returnValue)
+	}
+
+	// Decide retry. Reading from the in-memory jobMap snapshot is fine
+	// for attempts/backoff (immutable), but `atm` lives in Redis and
+	// may have been bumped by a prior retry on a different worker —
+	// we re-read it (via jobMap, which is the HGETALL captured at
+	// moveToActive). For BullMQ-correctness this is sufficient because
+	// stalled-recovery — the only way `atm` advances without us
+	// observing it — is not yet implemented.
+	atm := parseInt(jobMap["atm"])
+
+	if !w.shouldRetry(jobOpts, atm, out.err) {
+		return w.finishFailed(jobID, token, jobOpts.attempts, out.errReason, out.stacktrace)
+	}
+
+	delay := computeBackoffDelay(jobOpts.backoff, atm+1)
+	if delay > 0 {
+		return w.retryDelayed(jobID, token, delay, out.errReason, out.stacktrace)
+	}
+	return w.retryImmediate(jobID, token, jobOpts.lifo, out.errReason, out.stacktrace)
+}
+
+// finishCompleted writes the BullMQ completed-state transition.
+func (w *Worker) finishCompleted(jobID, token string, attempts int, returnValue string) error {
+	return w.runMoveToFinished(jobID, token, attempts, "completed", "returnvalue", returnValue, nil)
+}
+
+// finishFailed writes the BullMQ failed-state transition with the
+// failedReason + stacktrace HASH fields. attempts is forwarded so the
+// vendored Lua only emits `retries-exhausted` when retries are
+// genuinely exhausted (matching BullMQ TS behaviour for foreign
+// readers of the events stream).
+func (w *Worker) finishFailed(jobID, token string, attempts int, reason, stacktrace string) error {
+	return w.runMoveToFinished(jobID, token, attempts, "failed", "failedReason", reason,
+		[]any{"stacktrace", stacktrace})
+}
+
+// runMoveToFinished is the shared moveToFinished invocation. extraFields
+// piggybacks on ARGV[9] for the failed path to write stacktrace
+// alongside the state change.
+func (w *Worker) runMoveToFinished(jobID, token string, attempts int, target, msgProperty, msgValue string, extraFields []any) error {
 	now := time.Now().UnixMilli()
 
 	optsBytes, err := proto.EncodeMoveToFinishedOpts(proto.MoveToFinishedOpts{
 		Token:        token,
 		LockDuration: w.cfg.lockDuration.Milliseconds(),
+		Attempts:     attempts,
 		Name:         w.cfg.workerName,
 	})
 	if err != nil {
 		return fmt.Errorf("encode finish opts: %w", err)
 	}
 
-	jobFields, err := proto.EncodeJobFields("finishedOn", now)
+	// `finishedOn` を ARGV[9] に積まない: moveToFinished-14.lua が
+	// 末尾で HSET timestamp 同値を書き込むため重複になる。空 / extra
+	// だけを渡すことで余計な HMSET ペアを削減し、BullMQ TS の
+	// updateData 設計と揃える。
+	jobFields, err := proto.EncodeJobFields(extraFields...)
 	if err != nil {
 		return fmt.Errorf("encode job fields: %w", err)
 	}
@@ -322,6 +418,143 @@ func (w *Worker) finish(jobID, token, target, msgProperty, msgValue string) erro
 		return fmt.Errorf("moveToFinished(%s) returned error code %d", target, code)
 	}
 	return nil
+}
+
+// retryImmediate re-enqueues a failed job via retryJob-11.lua. The Lua
+// bumps `atm` (HINCRBY) atomically and writes failedReason/stacktrace
+// via ARGV[6] (jobFieldsToUpdate, msgpack flat array).
+func (w *Worker) retryImmediate(jobID, token string, lifo bool, reason, stacktrace string) error {
+	now := time.Now().UnixMilli()
+	pushCmd := "LPUSH"
+	if lifo {
+		pushCmd = "RPUSH"
+	}
+
+	jobFields, err := proto.EncodeJobFields("failedReason", reason, "stacktrace", stacktrace)
+	if err != nil {
+		return fmt.Errorf("encode retry job fields: %w", err)
+	}
+
+	keys := w.keys.retryJobKeys(jobID)
+	res, err := w.scripts.Run(
+		context.Background(),
+		lua.RetryJob,
+		keys,
+		w.keys.prefix,
+		now,
+		pushCmd,
+		jobID,
+		token,
+		jobFields,
+	)
+	if err != nil {
+		return fmt.Errorf("retryJob: %w", err)
+	}
+	if code, ok := res.(int64); ok && code < 0 {
+		return fmt.Errorf("retryJob returned error code %d", code)
+	}
+	return nil
+}
+
+// retryDelayed re-enqueues with a delay via moveToDelayed-12.lua,
+// honouring exponential / fixed backoff computed Go-side.
+func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason, stacktrace string) error {
+	now := time.Now().UnixMilli()
+	// 防御: computeBackoffDelay は >0 のはずだが、誤って 0 を渡すと
+	// Lua が delayedTimestamp = timestamp + 0 で即時 promote 候補に
+	// なる。1 ms 床値で「delayed」状態を確実にする。
+	delayMs := max(delay.Milliseconds(), 1)
+
+	jobFields, err := proto.EncodeJobFields("failedReason", reason, "stacktrace", stacktrace)
+	if err != nil {
+		return fmt.Errorf("encode retry job fields: %w", err)
+	}
+
+	keys := w.keys.moveToDelayedKeys(jobID)
+	res, err := w.scripts.Run(
+		context.Background(),
+		lua.MoveToDelayed,
+		keys,
+		w.keys.prefix,
+		now,
+		jobID,
+		token,
+		delayMs,
+		"0", // skip attempt = false: bump atm on this retry
+		jobFields,
+		"", // fetchNext=false
+		"", // opts: BullMQ accepts empty for the basic retry case
+	)
+	if err != nil {
+		return fmt.Errorf("moveToDelayed: %w", err)
+	}
+	if code, ok := res.(int64); ok && code < 0 {
+		return fmt.Errorf("moveToDelayed returned error code %d", code)
+	}
+	return nil
+}
+
+// jobOpts is the subset of the per-job opts JSON that the worker
+// needs after dequeue. The on-Redis HASH `opts` field is the JSON
+// shape produced by Job.optsAsJSON in BullMQ TS.
+type jobOpts struct {
+	attempts int
+	backoff  *BackoffStrategy
+	lifo     bool
+}
+
+// parseJobOpts deserialises the BullMQ HASH `opts` JSON into the
+// fields the retry path needs. Missing or malformed input falls back
+// to zero values (no retry / no backoff / FIFO push).
+func parseJobOpts(raw string) jobOpts {
+	var out jobOpts
+	if raw == "" || raw == "{}" {
+		return out
+	}
+	var m struct {
+		Attempts int  `json:"attempts"`
+		Lifo     bool `json:"lifo"`
+		Backoff  *struct {
+			Type  string `json:"type"`
+			Delay int64  `json:"delay"`
+		} `json:"backoff"`
+	}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return out
+	}
+	out.attempts = m.Attempts
+	out.lifo = m.Lifo
+	if m.Backoff != nil {
+		out.backoff = &BackoffStrategy{
+			Type:  m.Backoff.Type,
+			Delay: time.Duration(m.Backoff.Delay) * time.Millisecond,
+		}
+	}
+	return out
+}
+
+// shouldRetry encodes BullMQ's worker-side retry decision. attemptsMade
+// is the count BEFORE this failure (the value stored in HASH `atm`);
+// the +1 mirrors BullMQ's `attemptsMade + 1 < opts.attempts` check.
+func (w *Worker) shouldRetry(o jobOpts, attemptsMade int, err error) bool {
+	if errors.Is(err, ErrUnrecoverable) {
+		return false
+	}
+	if o.attempts <= 0 {
+		return false
+	}
+	return attemptsMade+1 < o.attempts
+}
+
+func parseInt(s string) int {
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // invokeHandler dispatches to the typed Handler[T] via the closure
@@ -482,5 +715,32 @@ func (k queueKeys) moveToFinishedKeys(jobID, target string) []string {
 		k.wait, k.active, k.prioritized, k.events, k.stalled,
 		k.limiter, k.delayed, k.paused, k.meta, k.pc,
 		resultSet, k.job(jobID), "", k.marker,
+	}
+}
+
+// retryJobKeys assembles KEYS[1..11] for retryJob-11.lua.
+//
+//	KEYS[1]  active     KEYS[2]  wait        KEYS[3]  paused
+//	KEYS[4]  job key    KEYS[5]  meta        KEYS[6]  events
+//	KEYS[7]  delayed    KEYS[8]  prioritized KEYS[9]  pc
+//	KEYS[10] marker     KEYS[11] stalled
+func (k queueKeys) retryJobKeys(jobID string) []string {
+	return []string{
+		k.active, k.wait, k.paused, k.job(jobID), k.meta, k.events,
+		k.delayed, k.prioritized, k.pc, k.marker, k.stalled,
+	}
+}
+
+// moveToDelayedKeys assembles KEYS[1..12] for moveToDelayed-12.lua.
+//
+//	KEYS[1]  marker     KEYS[2]  active      KEYS[3]  prioritized
+//	KEYS[4]  delayed    KEYS[5]  job key     KEYS[6]  events
+//	KEYS[7]  meta       KEYS[8]  stalled     KEYS[9]  wait
+//	KEYS[10] limiter    KEYS[11] paused      KEYS[12] pc
+func (k queueKeys) moveToDelayedKeys(jobID string) []string {
+	return []string{
+		k.marker, k.active, k.prioritized, k.delayed, k.job(jobID),
+		k.events, k.meta, k.stalled, k.wait, k.limiter,
+		k.paused, k.pc,
 	}
 }
