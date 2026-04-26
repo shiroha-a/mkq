@@ -36,6 +36,8 @@ Entry points:
 - `updateProgress-3.lua`
 - `updateData-1.lua`
 - `addLog-2.lua`
+- `getCounts-1.lua`
+- `getRanges-1.lua`
 
 `includes/` — every script transitively reachable from the entry points
 above via `--- @include "..."` directives.
