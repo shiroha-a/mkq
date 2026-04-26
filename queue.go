@@ -36,27 +36,27 @@ func Define[T any](c *Client, name string, _ ...QueueOption) *Queue[T] {
 		name:   name,
 		keys:   keys.New(c.keyPrefix, name),
 	}
-	q.stampVersion()
-	q.registerInClient()
+	q.bootstrap()
 	return q
 }
 
-// registerInClient is the SADD half of the queue-registry contract
-// (Client.Queues consumes the same SET). Best-effort: a Redis hiccup
-// here just means Queues() will under-report on the next call.
-func (q *Queue[T]) registerInClient() {
+// bootstrap fires the two best-effort side effects Define needs:
+// stamp meta.version (HSETNX, BullMQ-compatible) and add this queue
+// to the Client.Queues registry SET. Both are pipelined so Define's
+// worst-case latency stays within a single 2s timeout instead of
+// stacking — a single Redis round-trip carries both writes.
+//
+// Errors are intentionally dropped: a Redis hiccup here just means
+// the version stays unstamped (interop test will catch the gap on
+// the next bull-board read) or Queues() under-reports until the
+// next Define for the same name re-runs the SADD.
+func (q *Queue[T]) bootstrap() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = q.client.rdb.SAdd(ctx, q.client.queueRegistryKey(), q.name).Err()
-}
-
-// stampVersion is best-effort: a Redis hiccup here doesn't break the
-// queue, it just leaves the version field unwritten. The interop test
-// will catch that on the next bull-board read.
-func (q *Queue[T]) stampVersion() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = q.client.rdb.HSetNX(ctx, q.keys.Meta(), "version", versionTag()).Err()
+	pipe := q.client.rdb.Pipeline()
+	pipe.HSetNX(ctx, q.keys.Meta(), "version", versionTag())
+	pipe.SAdd(ctx, q.client.queueRegistryKey(), q.name)
+	_, _ = pipe.Exec(ctx)
 }
 
 // Name returns the queue name as passed to Define.

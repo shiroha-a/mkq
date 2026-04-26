@@ -58,14 +58,15 @@ func (q *Queue[T]) ListJobs(ctx context.Context, bucket JobBucket, start, end in
 		return nil, fmt.Errorf("mkq: getRanges: %w", err)
 	}
 
-	// getRanges returns one entry per requested bucket; we only ever
-	// pass a single bucket, so unwrap the outer wrapper.
+	// getRanges-1.lua は要求された bucket ごとに 1 エントリ返す。
+	// ListJobs は常に 1 bucket しか渡さないので、外側の配列を剥がす。
 	outer, ok := res.([]any)
 	if !ok {
 		return nil, fmt.Errorf("mkq: getRanges: unexpected result type %T", res)
 	}
 	if len(outer) == 0 {
-		return nil, nil
+		// safe-range contract: 空でも nil ではなく empty slice を返す。
+		return []ListedJob[T]{}, nil
 	}
 	ids, err := toStringSlice(outer[0])
 	if err != nil {
