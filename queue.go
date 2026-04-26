@@ -257,8 +257,8 @@ func buildJobState(hash map[string]string) *JobState {
 		st.Progress = json.RawMessage(pg)
 	}
 	if st_ := hash["stacktrace"]; st_ != "" {
-		// BullMQ stores stacktrace as JSON-encoded array of strings.
-		// Best-effort decode; bad input → empty slice.
+		// BullMQ は stacktrace を JSON エンコードされた文字列配列として保存する。
+		// best-effort デコード; 不正入力 → 空スライス。
 		var traces []string
 		if err := json.Unmarshal([]byte(st_), &traces); err == nil {
 			st.Stacktrace = traces
