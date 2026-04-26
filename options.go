@@ -66,12 +66,19 @@ func WithBackoff(b BackoffStrategy) AddOption {
 // n>0 keeps the most recent n entries via the vendored
 // removeJobsByMaxCount Lua. Not calling WithKeepCompleted preserves
 // BullMQ's default (keep all completed jobs).
+//
+// n must be >= 0. Negative values are forwarded as-is to the
+// vendored Lua, where BullMQ's `maxCount > 0` guard skips trimming —
+// the practical effect is identical to "keep all", but the value is
+// not normalised here so callers should treat negatives as
+// programmer error.
 func WithKeepCompleted(n int) AddOption {
 	return func(c *addConfig) { c.keepCompleted = &n }
 }
 
 // WithKeepFailed bounds the size of the failed ZSET, mirroring
-// WithKeepCompleted's semantics for the failure path.
+// WithKeepCompleted's semantics (and its n>=0 expectation) for the
+// failure path.
 func WithKeepFailed(n int) AddOption {
 	return func(c *addConfig) { c.keepFailed = &n }
 }

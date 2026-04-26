@@ -50,7 +50,7 @@ type Backoff struct {
 // The encoding uses a string-keyed map; missing fields are simply
 // omitted so Lua's `opts['x'] or default` idiom yields the right value.
 func EncodeAddOpts(o AddOpts) ([]byte, error) {
-	m := make(map[string]any, 6)
+	m := make(map[string]any, 8)
 	if o.Delay != 0 {
 		m["delay"] = o.Delay
 	}
