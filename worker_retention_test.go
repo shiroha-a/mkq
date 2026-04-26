@@ -135,6 +135,64 @@ func TestWorker_Retention_DefaultKeepsAll(t *testing.T) {
 	assert.EqualValues(t, total, got, "default retention must keep all completed jobs")
 }
 
+// TestWorker_Retention_KeepCompletedAgeTrims pins the age-based
+// retention path. WithKeepCompletedAge(2s) makes each subsequent
+// finalisation tick drop entries older than 2 seconds — so jobs
+// completed before a 3-second sleep get evicted when a fresh job
+// finishes after the sleep.
+func TestWorker_Retention_KeepCompletedAgeTrims(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Phase 1: 3 jobs land in completed.
+	const oldCount = 3
+	for i := range oldCount {
+		_, err := queue.Add(ctx, testPayload{Inbox: strconv.Itoa(i)},
+			mkq.WithKeepCompletedAge(2*time.Second),
+		)
+		require.NoError(t, err)
+	}
+
+	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		return nil, nil
+	}, mkq.WithIdlePollInterval(20*time.Millisecond))
+	require.NoError(t, err)
+	defer worker.Stop(context.Background())
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+	waitFor(t, ctx, 50*time.Millisecond, func() bool {
+		n, _ := rdb.ZCard(ctx, base+"completed").Result()
+		return n == int64(oldCount)
+	})
+
+	// Phase 2: wait past the 2s window so the existing entries
+	// become eligible for age-trim.
+	time.Sleep(2500 * time.Millisecond)
+
+	// Phase 3: enqueue + process one more job. Its moveToFinished
+	// runs removeJobsByMaxAge(now, age=2s, ...) which evicts the
+	// older entries. completed should end up with just the new job.
+	freshJob, err := queue.Add(ctx, testPayload{Inbox: "fresh"},
+		mkq.WithKeepCompletedAge(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	waitFor(t, ctx, 50*time.Millisecond, func() bool {
+		v, _ := rdb.ZScore(ctx, base+"completed", freshJob.ID).Result()
+		return v > 0
+	})
+
+	got, err := rdb.ZCard(ctx, base+"completed").Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, got, "age-trim must keep only entries newer than the window")
+}
+
 // TestWorker_Retention_KeepFailedTrims is the failure-side analogue
 // of KeepCompletedTrims.
 func TestWorker_Retention_KeepFailedTrims(t *testing.T) {
