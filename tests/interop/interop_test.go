@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -122,9 +123,13 @@ func startNodeWorker(t *testing.T, prefix, queueName string) {
 	cmd.Stderr = os.Stderr
 	require.NoError(t, cmd.Start())
 
-	// Read until {"event":"ready"} appears, with a hard timeout so we
-	// never wedge.
+	// Drain stdout for the lifetime of the subprocess. We listen for
+	// {"event":"ready"} to release the caller, then keep draining
+	// (silently discarding) until EOF so any incidental console
+	// output BullMQ might emit later doesn't fill the OS pipe buffer
+	// (~64KB on Linux) and deadlock the worker on its next write.
 	ready := make(chan struct{})
+	var readyOnce sync.Once
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
@@ -133,8 +138,7 @@ func startNodeWorker(t *testing.T, prefix, queueName string) {
 				Event string `json:"event"`
 			}
 			if json.Unmarshal([]byte(line), &msg) == nil && msg.Event == "ready" {
-				close(ready)
-				return
+				readyOnce.Do(func() { close(ready) })
 			}
 		}
 	}()
