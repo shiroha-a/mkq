@@ -4,6 +4,7 @@ package interop_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,15 +37,16 @@ func TestInterop_QueueEvents_ObservesBullMQTSEmissions(t *testing.T) {
 	}
 	var got capture
 	done := make(chan struct{})
+	var doneOnce sync.Once
 	go func() {
 		_ = qe.Subscribe(context.Background(), func(ev mkq.Event) error {
 			switch e := ev.(type) {
 			case mkq.CompletedEvent:
 				got.completed = &e
-				close(done)
+				doneOnce.Do(func() { close(done) })
 			case mkq.FailedEvent:
 				got.failed = &e
-				close(done)
+				doneOnce.Do(func() { close(done) })
 			}
 			return nil
 		})

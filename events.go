@@ -171,6 +171,12 @@ func NewQueueEvents[T any](q *Queue[T]) *QueueEvents {
 
 // Close terminates an in-flight Subscribe. Safe to call multiple times.
 // After Close, Subscribe returns nil on the next loop iteration.
+//
+// A QueueEvents instance is single-use: once Close has been called the
+// underlying channel stays closed forever, so any subsequent Subscribe
+// call returns nil immediately without delivering events. Construct
+// a fresh QueueEvents (NewQueueEvents) when you need a new
+// subscription.
 func (qe *QueueEvents) Close() {
 	qe.closeOnce.Do(func() { close(qe.closeCh) })
 }
