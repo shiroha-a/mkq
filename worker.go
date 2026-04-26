@@ -19,9 +19,12 @@ import (
 
 // Handler is the user function invoked once per dequeued job. The
 // returned value (any) is JSON-encoded and stored in the BullMQ
-// `returnvalue` HASH field on success. A non-nil error transitions the
-// job to failed; mkq's first worker PR does not yet retry, regardless
-// of WithAttempts.
+// `returnvalue` HASH field on success.
+//
+// A non-nil error transitions the job to retry or failed depending on
+// the job's WithAttempts / WithBackoff configuration. Wrapping the
+// returned error with ErrUnrecoverable forces the failed transition
+// regardless of remaining attempts.
 type Handler[T any] func(ctx context.Context, job *Job[T]) (any, error)
 
 // Worker is the lifecycle handle returned by Process. It owns its
@@ -314,8 +317,10 @@ func (w *Worker) heartbeat(ctx context.Context, done chan<- struct{}, token, job
 // the BullMQ HASH `atm` (attempts made) counter atomically inside
 // the script.
 func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out handlerOutcome) error {
+	jobOpts := parseJobOpts(jobMap["opts"])
+
 	if out.success {
-		return w.finishCompleted(jobID, token, out.returnValue)
+		return w.finishCompleted(jobID, token, jobOpts.attempts, out.returnValue)
 	}
 
 	// Decide retry. Reading from the in-memory jobMap snapshot is fine
@@ -325,11 +330,10 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 	// moveToActive). For BullMQ-correctness this is sufficient because
 	// stalled-recovery — the only way `atm` advances without us
 	// observing it — is not yet implemented.
-	jobOpts := parseJobOpts(jobMap["opts"])
 	atm := parseInt(jobMap["atm"])
 
 	if !w.shouldRetry(jobOpts, atm, out.err) {
-		return w.finishFailed(jobID, token, out.errReason, out.stacktrace)
+		return w.finishFailed(jobID, token, jobOpts.attempts, out.errReason, out.stacktrace)
 	}
 
 	delay := computeBackoffDelay(jobOpts.backoff, atm+1)
@@ -340,26 +344,30 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 }
 
 // finishCompleted writes the BullMQ completed-state transition.
-func (w *Worker) finishCompleted(jobID, token, returnValue string) error {
-	return w.runMoveToFinished(jobID, token, "completed", "returnvalue", returnValue, nil)
+func (w *Worker) finishCompleted(jobID, token string, attempts int, returnValue string) error {
+	return w.runMoveToFinished(jobID, token, attempts, "completed", "returnvalue", returnValue, nil)
 }
 
 // finishFailed writes the BullMQ failed-state transition with the
-// failedReason + stacktrace HASH fields.
-func (w *Worker) finishFailed(jobID, token, reason, stacktrace string) error {
-	return w.runMoveToFinished(jobID, token, "failed", "failedReason", reason,
+// failedReason + stacktrace HASH fields. attempts is forwarded so the
+// vendored Lua only emits `retries-exhausted` when retries are
+// genuinely exhausted (matching BullMQ TS behaviour for foreign
+// readers of the events stream).
+func (w *Worker) finishFailed(jobID, token string, attempts int, reason, stacktrace string) error {
+	return w.runMoveToFinished(jobID, token, attempts, "failed", "failedReason", reason,
 		[]any{"stacktrace", stacktrace})
 }
 
 // runMoveToFinished is the shared moveToFinished invocation. extraFields
 // piggybacks on ARGV[9] for the failed path to write stacktrace
 // alongside the state change.
-func (w *Worker) runMoveToFinished(jobID, token, target, msgProperty, msgValue string, extraFields []any) error {
+func (w *Worker) runMoveToFinished(jobID, token string, attempts int, target, msgProperty, msgValue string, extraFields []any) error {
 	now := time.Now().UnixMilli()
 
 	optsBytes, err := proto.EncodeMoveToFinishedOpts(proto.MoveToFinishedOpts{
 		Token:        token,
 		LockDuration: w.cfg.lockDuration.Milliseconds(),
+		Attempts:     attempts,
 		Name:         w.cfg.workerName,
 	})
 	if err != nil {

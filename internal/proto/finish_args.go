@@ -17,9 +17,12 @@ import (
 type MoveToFinishedOpts struct {
 	Token        string
 	LockDuration int64
-	// Attempts mirrors the user-facing WithAttempts. Lua uses it to
-	// decide whether a failure should be retried; mkq's first worker
-	// PR does not implement retry so this is informational only.
+	// Attempts mirrors the user-facing WithAttempts. The vendored Lua
+	// gates the `retries-exhausted` event on
+	// `attemptsMade >= attempts`, so callers that go straight to
+	// failed (e.g. ErrUnrecoverable) must still pass the job's
+	// configured attempts to avoid emitting a spurious exhaustion
+	// event into the wire-format events stream.
 	Attempts int
 	// KeepJobs configures retention for the completed/failed ZSET.
 	// Nil means BullMQ's default retention (keep all).

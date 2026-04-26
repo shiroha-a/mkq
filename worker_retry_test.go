@@ -173,6 +173,53 @@ func TestWorker_Retry_UnrecoverableSkipsRetry(t *testing.T) {
 	assert.Contains(t, h["failedReason"], "hard fail")
 }
 
+// TestWorker_Retry_UnrecoverableSuppressesRetriesExhaustedEvent pins
+// a BullMQ wire-format detail: when WithAttempts(N) is configured but
+// the handler short-circuits via ErrUnrecoverable on the first run,
+// the events stream must NOT carry a `retries-exhausted` entry.
+//
+// BullMQ TS gates the event on `attemptsMade >= attempts`; if the
+// worker omits the `attempts` opt forwarded into moveToFinished's
+// Lua, the gate degrades to `1 >= 0` and emits spuriously, breaking
+// bull-board / foreign QueueEvents consumers.
+func TestWorker_Retry_UnrecoverableSuppressesRetriesExhaustedEvent(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	job, err := queue.Add(ctx, testPayload{},
+		mkq.WithAttempts(5),
+		mkq.WithBackoff(mkq.FixedBackoff(10*time.Millisecond)),
+	)
+	require.NoError(t, err)
+
+	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		return nil, fmt.Errorf("hard fail: %w", mkq.ErrUnrecoverable)
+	}, mkq.WithIdlePollInterval(10*time.Millisecond))
+	require.NoError(t, err)
+	defer worker.Stop(context.Background())
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+	waitFor(t, ctx, 20*time.Millisecond, func() bool {
+		v, _ := rdb.ZScore(ctx, base+"failed", job.ID).Result()
+		return v > 0
+	})
+
+	// XRANGEで全eventを取り、retries-exhausted が無いことを確認。
+	entries, err := rdb.XRange(ctx, base+"events", "-", "+").Result()
+	require.NoError(t, err)
+	for _, e := range entries {
+		ev, _ := e.Values["event"].(string)
+		assert.NotEqual(t, "retries-exhausted", ev,
+			"retries-exhausted must not be emitted when WithAttempts(5) is unspent (event=%v jobId=%v)", e.Values["event"], e.Values["jobId"])
+	}
+}
+
 // TestWorker_Retry_StacktraceFieldShape pins the BullMQ wire-shape
 // for the stacktrace HASH field: a JSON array of strings.
 func TestWorker_Retry_StacktraceFieldShape(t *testing.T) {
