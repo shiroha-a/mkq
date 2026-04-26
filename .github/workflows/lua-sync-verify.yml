@@ -1,0 +1,37 @@
+name: lua sync verify
+
+# Runs script/sync-lua.sh against the pinned BullMQ submodule and fails
+# if the result differs from internal/lua/scripts/. Catches the
+# "vendored lua copies got hand-edited" or "submodule pin advanced but
+# the copies were not refreshed" classes of drift before they reach
+# main.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: run sync-lua.sh
+        run: script/sync-lua.sh
+
+      - name: assert no drift
+        run: |
+          if ! git diff --quiet internal/lua/scripts/; then
+            echo "::error::vendored lua diverged from third_party/bullmq pin"
+            git diff internal/lua/scripts/
+            exit 1
+          fi
+          echo "OK: vendored lua matches submodule pin"
