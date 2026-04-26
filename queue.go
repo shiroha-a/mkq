@@ -234,15 +234,21 @@ func (q *Queue[T]) Get(ctx context.Context, jobID string) (*Job[T], *JobState, e
 
 // buildJobState extracts the post-processing fields from a HGETALL
 // snapshot. Missing fields stay at their Go zero values.
+//
+// Timestamp fields are parsed via strconv.ParseInt with bitSize=64
+// rather than parseInt (which delegates to strconv.Atoi → int) so
+// that 13-digit Unix-millisecond values survive on 32-bit platforms
+// where int wraps at ~2.1 × 10^9. Mirrors the existing buildJob
+// timestamp parsing in worker.go.
 func buildJobState(hash map[string]string) *JobState {
 	st := &JobState{
 		FailedReason: hash["failedReason"],
 	}
-	if v := parseInt(hash["processedOn"]); v > 0 {
-		st.ProcessedOn = time.UnixMilli(int64(v))
+	if v, err := strconv.ParseInt(hash["processedOn"], 10, 64); err == nil && v > 0 {
+		st.ProcessedOn = time.UnixMilli(v)
 	}
-	if v := parseInt(hash["finishedOn"]); v > 0 {
-		st.FinishedOn = time.UnixMilli(int64(v))
+	if v, err := strconv.ParseInt(hash["finishedOn"], 10, 64); err == nil && v > 0 {
+		st.FinishedOn = time.UnixMilli(v)
 	}
 	if rv := hash["returnvalue"]; rv != "" {
 		st.ReturnValue = json.RawMessage(rv)
