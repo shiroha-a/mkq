@@ -73,3 +73,32 @@ func (c *Client) Close() error {
 // imported from internal/keys to keep the public surface free of
 // internal-package leaks.
 const defaultKeyPrefix = "bull"
+
+// queueRegistryKey is the auxiliary SET that tracks every queue
+// Define[T] has touched against this Client. The key uses a double
+// colon (empty queue-name slot) so it cannot collide with any
+// BullMQ queue key — BullMQ requires a non-empty queue name, so
+// `{prefix}::queues` is unreachable from the BullMQ wire format.
+//
+// BullMQ itself has no queue registry (bull-board accepts the queue
+// list as configuration); this is an mkq-only addition. Foreign
+// queues that BullMQ TS created without mkq Define'ing them won't
+// appear here — the registry under-reports rather than over-reports.
+func (c *Client) queueRegistryKey() string {
+	return c.keyPrefix + "::queues"
+}
+
+// Queues returns every queue name mkq has Define'd against this
+// client (idempotent registration in Define keeps the SET clean).
+//
+// Foreign queues not Define'd through mkq are absent; for a complete
+// view, mk-go-style admin paths can layer a SCAN-based discovery on
+// top — that's a separate API addition tracked in the inspector
+// follow-up.
+func (c *Client) Queues(ctx context.Context) ([]string, error) {
+	res, err := c.rdb.SMembers(ctx, c.queueRegistryKey()).Result()
+	if err != nil {
+		return nil, fmt.Errorf("mkq: SMembers %s: %w", c.queueRegistryKey(), err)
+	}
+	return res, nil
+}

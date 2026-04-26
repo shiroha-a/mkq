@@ -37,7 +37,17 @@ func Define[T any](c *Client, name string, _ ...QueueOption) *Queue[T] {
 		keys:   keys.New(c.keyPrefix, name),
 	}
 	q.stampVersion()
+	q.registerInClient()
 	return q
+}
+
+// registerInClient is the SADD half of the queue-registry contract
+// (Client.Queues consumes the same SET). Best-effort: a Redis hiccup
+// here just means Queues() will under-report on the next call.
+func (q *Queue[T]) registerInClient() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = q.client.rdb.SAdd(ctx, q.client.queueRegistryKey(), q.name).Err()
 }
 
 // stampVersion is best-effort: a Redis hiccup here doesn't break the

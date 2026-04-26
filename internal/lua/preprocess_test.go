@@ -25,6 +25,8 @@ func TestPreprocess_VendoredEntryPoints(t *testing.T) {
 		"updateProgress-3",
 		"updateData-1",
 		"addLog-2",
+		"getCounts-1",
+		"getRanges-1",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
