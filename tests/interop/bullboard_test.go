@@ -122,9 +122,9 @@ func TestInterop_BullBoardReadsQueueState(t *testing.T) {
 	// 3. Boot bull-board pointed at the queue we just populated.
 	port := startBullBoard(t, prefix, queueName)
 
-	// 4. Hit the bull-board JSON API. The Express adapter exposes
-	//    /admin/api/queues/<encoded-prefixed-queue-name>?activeQueue=...&status=...
-	//    but the simplest "queues exist" smoke is the index endpoint.
+	// 4. bull-board の JSON API を叩く。Express アダプタは
+	//    /admin/api/queues/<encoded-prefixed-queue-name>?activeQueue=...&status=... を公開するが、
+	//    「キューが存在すること」の smoke には index エンドポイントが最もシンプル。
 	url := fmt.Sprintf("http://127.0.0.1:%d/admin/api/queues", port)
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Get(url)
@@ -146,9 +146,9 @@ func TestInterop_BullBoardReadsQueueState(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &page),
 		"bull-board response must be JSON: %s", string(body))
 
-	// 5. Find our queue in the response and verify counts. bull-board
-	//    keys queues by their queueQualifiedName ({prefix}:{queue}),
-	//    surfaced under either `name` or `displayName`.
+	// 5. レスポンスから対象キューを探してカウントを検証する。bull-board は
+	//    queueQualifiedName ({prefix}:{queue}) でキューを識別し、`name` または
+	//    `displayName` のいずれかに表示されるため両方を確認する。
 	var found bool
 	var counts map[string]int
 	for _, q := range page.Queues {
