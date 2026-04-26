@@ -140,7 +140,6 @@ func TestInterop_BullBoardReadsQueueState(t *testing.T) {
 		Queues []struct {
 			Name        string         `json:"name"`
 			Counts      map[string]int `json:"counts"`
-			StatusOK    bool           `json:"isPaused"`
 			DisplayName string         `json:"displayName"`
 		} `json:"queues"`
 	}
