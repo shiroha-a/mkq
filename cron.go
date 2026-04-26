@@ -82,8 +82,12 @@ func (c *cachedCron) nextFire(from time.Time) time.Time {
 }
 
 // isAtEvery detects `@every <duration>` so the rejection error can
-// be specific. Case-insensitive prefix check, mirroring cron-parser's
-// "@every" non-support stance.
+// be specific. Case-insensitive prefix check followed by a
+// word-boundary check (next character must be whitespace or
+// end-of-string) to avoid false positives like `@everyday` or
+// `@everyone` — those should fall through to the generic invalid-
+// pattern error instead of the misleading "use WithScheduleEvery"
+// hint.
 func isAtEvery(s string) bool {
 	const prefix = "@every"
 	if len(s) < len(prefix) {
@@ -98,5 +102,12 @@ func isAtEvery(s string) bool {
 			return false
 		}
 	}
-	return true
+	if len(s) == len(prefix) {
+		return true
+	}
+	switch s[len(prefix)] {
+	case ' ', '\t':
+		return true
+	}
+	return false
 }

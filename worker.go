@@ -517,9 +517,14 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 
 	// pattern-mode は Go 側で次 millis を計算 → ARGV[1]。
 	// every-mode は "0" を渡し、lua が getJobSchedulerEveryNextMillis
-	// で計算する。
+	// で計算する。every-mode の場合は endDate ガードを行うために
+	// nextMillis を Go 側でも算出する (lua に任せるとガードできない)。
+	nowTime := time.Now()
+	now := nowTime.UnixMilli()
 	nextMillisArg := "0"
-	if pattern != "" {
+	var nextMillisVal int64
+	switch {
+	case pattern != "":
 		cc, err := parseCron(pattern, tz)
 		if err != nil {
 			// HASH に書かれている pattern が parse できない = データ
@@ -527,10 +532,21 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 			// no-op (次 iteration が出ないだけ)。
 			return
 		}
-		nextMillisArg = strconv.FormatInt(cc.nextFire(time.Now()).UnixMilli(), 10)
+		nextMillisVal = cc.nextFire(nowTime).UnixMilli()
+		nextMillisArg = strconv.FormatInt(nextMillisVal, 10)
+	default: // every-mode
+		// getJobSchedulerEveryNextMillis のロジック: 前回 fire 時刻 +
+		// every。前回 fire 時刻が無い (初回) なら startDate or now。
+		// rescheduleNext は worker が job を完了した直後に呼ばれるので、
+		// 必ず prevMillis が ZSCORE で取れる前提だが、endDate ガード
+		// 用途では now + every で近似すれば十分。
+		nextMillisVal = now + everyMs
 	}
-
-	now := time.Now().UnixMilli()
+	if endDate > 0 && nextMillisVal > endDate {
+		// BullMQ TS は worker.getNextMillis() で同様の endDate チェックを
+		// 行っており、超過した場合は新しい iteration を作らない。
+		return
+	}
 	keysArg := []string{
 		w.keys.repeat,      // KEYS[1]  repeat
 		w.keys.delayed,     // KEYS[2]  delayed

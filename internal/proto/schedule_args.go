@@ -7,9 +7,10 @@ import (
 // ScheduleOpts is the BullMQ schedule template — the value
 // addJobScheduler-11.lua reads as ARGV[2] (cmsgpack-unpacked).
 //
-// EveryMs と Pattern は相互排他: every-mode は Lua 側で次 millis を
-// 再計算するが、pattern-mode は Go 側で計算した nextMillis を
-// ARGV[1] に渡し、Lua はそれを verbatim で使用する。
+// EveryMs and Pattern are mutually exclusive: every-mode lets Lua
+// recompute the next millis via getJobSchedulerEveryNextMillis,
+// while pattern-mode passes a Go-computed nextMillis in ARGV[1]
+// and Lua uses it verbatim.
 type ScheduleOpts struct {
 	// Name is the BullMQ job name written to each created instance
 	// (Job.name). Defaults to the queue name.
