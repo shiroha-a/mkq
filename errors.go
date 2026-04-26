@@ -36,3 +36,28 @@ var ErrJobNotFound = errors.New("mkq: job not found")
 // Queue.Get, and the handler-dispatch path — carry the back-pointer
 // automatically.
 var ErrJobDetached = errors.New("mkq: job has no queue back-pointer (constructed outside mkq?)")
+
+// ErrJobActive is returned by Queue.RemoveJob when the target job
+// is currently locked (in active state). BullMQ's removeJob-2.lua
+// returns 0 in this case; mkq surfaces it as ErrJobActive so callers
+// can retry after the in-flight handler finishes.
+var ErrJobActive = errors.New("mkq: job is active (locked) and cannot be removed")
+
+// ErrJobIsScheduler is returned by Queue.RemoveJob when the job is
+// the current iteration of a recurring schedule (jobId begins with
+// "repeat:"). Removing such a job individually would orphan the
+// schedule; use Queue.RemoveSchedule for the whole schedule instead.
+// BullMQ's removeJob-2.lua returns -8 in this case.
+var ErrJobIsScheduler = errors.New("mkq: job is owned by a scheduler; use RemoveSchedule")
+
+// ErrJobNotInDelayed is returned by Queue.PromoteJob when the
+// target job is not currently in the delayed ZSET (already promoted,
+// already finished, or never delayed). BullMQ's promote-9.lua
+// returns -3 in this case.
+var ErrJobNotInDelayed = errors.New("mkq: job is not in the delayed state")
+
+// ErrJobNotInExpectedState is returned by Queue.RetryJob when the
+// target job is not in the source state requested via
+// WithRetryFromState (default: "failed"). BullMQ's reprocessJob-8.lua
+// returns -3 in this case.
+var ErrJobNotInExpectedState = errors.New("mkq: job is not in the expected source state for retry")

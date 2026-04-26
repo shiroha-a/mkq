@@ -38,6 +38,10 @@ Entry points:
 - `addLog-2.lua`
 - `getCounts-1.lua`
 - `getRanges-1.lua`
+- `removeJob-2.lua`
+- `drain-5.lua`
+- `promote-9.lua`
+- `reprocessJob-8.lua`
 
 `includes/` — every script transitively reachable from the entry points
 above via `--- @include "..."` directives.
