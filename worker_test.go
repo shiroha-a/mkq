@@ -193,6 +193,53 @@ func TestWorker_Process_Concurrency(t *testing.T) {
 	assert.EqualValues(t, N, done.Load(), "every handler must have run")
 }
 
+// TestWorker_Process_SerialJobsOnSingleSlot regression-tests two
+// behaviours that PR #9's first round broke:
+//
+//  1. Without WithConcurrency(1) gating, a single dispatch loop must
+//     still process N jobs sequentially without skipping any. Earlier
+//     code spawned per-job goroutines, which masked correctness bugs
+//     by parallelising around them.
+//
+//  2. moveToFinished's vendored Lua needs maxMetricsSize="" or it
+//     crashes via collectMetrics on the *second* job (tonumber(nil)
+//     in math.min). Running multiple jobs through one slot exercises
+//     this path.
+func TestWorker_Process_SerialJobsOnSingleSlot(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const N = 5
+	for i := range N {
+		_, err := queue.Add(ctx, testPayload{Inbox: strconv.Itoa(i)})
+		require.NoError(t, err)
+	}
+
+	var seen atomic.Int64
+	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		seen.Add(1)
+		return nil, nil
+	},
+		mkq.WithConcurrency(1),
+		mkq.WithIdlePollInterval(20*time.Millisecond),
+	)
+	require.NoError(t, err)
+	defer worker.Stop(context.Background())
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+	waitFor(t, ctx, 20*time.Millisecond, func() bool {
+		n, _ := rdb.ZCard(ctx, base+"completed").Result()
+		return n == int64(N)
+	})
+	assert.EqualValues(t, N, seen.Load())
+}
+
 func TestWorker_Process_PriorityOrderingWithinPrioritized(t *testing.T) {
 	t.Parallel()
 	prefix := uniquePrefix(t)

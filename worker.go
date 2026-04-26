@@ -32,16 +32,15 @@ type Worker struct {
 	scripts *lua.Scripter
 
 	// runCtx is cancelled by Stop to break dispatch goroutines out of
-	// the dequeue loop.
+	// the dequeue loop. Each in-flight handler derives its job ctx
+	// from runCtx, so cancellation propagates automatically.
 	runCtx    context.Context
 	runCancel context.CancelFunc
 
-	// run waits for dispatch goroutines.
+	// run tracks every dispatch goroutine. Because dispatchLoop runs
+	// the handler synchronously (one in-flight job per loop), this
+	// also covers handler completion — no separate WaitGroup needed.
 	run sync.WaitGroup
-	// jobs waits for in-flight handler goroutines (a subset of the
-	// dispatch goroutines' work, but tracked separately so Stop can
-	// distinguish "loop exited" from "handler still running").
-	jobs sync.WaitGroup
 }
 
 // queueKeys is a snapshot of the per-queue Redis keys consumed by
@@ -107,7 +106,6 @@ func (w *Worker) Stop(ctx context.Context) error {
 	loopDone := make(chan struct{})
 	go func() {
 		w.run.Wait()
-		w.jobs.Wait()
 		close(loopDone)
 	}()
 	select {
@@ -187,42 +185,28 @@ func (w *Worker) tryOnce(handlerAny any) (bool, error) {
 		return false, nil
 	}
 
-	w.jobs.Add(1)
-	go w.processJob(handlerAny, token, jobID, jobMap)
+	w.processJob(handlerAny, token, jobID, jobMap)
 	return true, nil
 }
 
 // processJob runs the handler for one acquired job, manages the lock
 // heartbeat, and writes the terminal state via moveToFinished.
+//
+// The per-job ctx is derived from runCtx so worker shutdown propagates
+// without a separate bridge goroutine. Heartbeat owns its own goroutine
+// because the BullMQ extendLock semantics require periodic ticks
+// independent of handler progress.
 func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[string]string) {
-	defer w.jobs.Done()
-
-	// Per-job context: cancelled when worker stops or when the lock
-	// heartbeat fails.
-	jobCtx, cancelJob := context.WithCancel(context.Background())
+	jobCtx, cancelJob := context.WithCancel(w.runCtx)
 	defer cancelJob()
 
-	// Stop heartbeat must run before moveToFinished so the lock token
-	// is still valid when Lua re-validates ownership.
 	hbDone := make(chan struct{})
 	go w.heartbeat(jobCtx, hbDone, token, jobID, cancelJob)
-	defer func() {
-		<-hbDone
-	}()
-
-	// Bridge worker shutdown into the per-job ctx.
-	go func() {
-		select {
-		case <-w.runCtx.Done():
-			cancelJob()
-		case <-jobCtx.Done():
-		}
-	}()
 
 	target, msgProperty, msgValue := w.runHandler(jobCtx, handlerAny, jobID, jobMap)
 
-	// jobCtx is cancelled by defer; heartbeat exits before we try the
-	// finish call so the lock is still ours.
+	// Heartbeat must finish before moveToFinished so its extendLock
+	// won't race with moveToFinished's lock-token validation.
 	cancelJob()
 	<-hbDone
 

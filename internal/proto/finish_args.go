@@ -38,10 +38,16 @@ type KeepJobs struct {
 
 // EncodeMoveToFinishedOpts returns the msgpack-encoded ARGV[8] payload.
 //
-// keepJobs is always emitted (as an empty map when unset) because the
-// vendored moveToFinished Lua dereferences `opts['keepJobs']['count']`
-// without a nil guard; sending nil would surface as a runtime "attempt
-// to index a nil value" error from Redis.
+// Two fields are always emitted regardless of caller input because the
+// vendored Lua dereferences them without nil guards:
+//
+//   - keepJobs: opts['keepJobs']['count'] is read directly. nil would
+//     produce "attempt to index a nil value".
+//   - maxMetricsSize: collectMetrics() does
+//     `tonumber(maxDataPoints)` which crashes with "bad argument" if
+//     maxDataPoints is nil but the outer guard `if maxMetricsSize ~=
+//     ""` permitted entry. BullMQ TypeScript sends "" when metrics
+//     are disabled; mkq mirrors that.
 func EncodeMoveToFinishedOpts(o MoveToFinishedOpts) ([]byte, error) {
 	keep := map[string]any{}
 	if o.KeepJobs != nil {
@@ -53,10 +59,11 @@ func EncodeMoveToFinishedOpts(o MoveToFinishedOpts) ([]byte, error) {
 		}
 	}
 	m := map[string]any{
-		"token":        o.Token,
-		"lockDuration": o.LockDuration,
-		"attempts":     o.Attempts,
-		"keepJobs":     keep,
+		"token":          o.Token,
+		"lockDuration":   o.LockDuration,
+		"attempts":       o.Attempts,
+		"keepJobs":       keep,
+		"maxMetricsSize": "",
 	}
 	if o.Name != "" {
 		m["name"] = o.Name

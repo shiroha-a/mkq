@@ -51,12 +51,13 @@ func TestEncodeMoveToActiveOpts_OmitsEmptyName(t *testing.T) {
 	}
 }
 
-func TestEncodeMoveToFinishedOpts_AlwaysIncludesKeepJobs(t *testing.T) {
+func TestEncodeMoveToFinishedOpts_AlwaysIncludesNilSafeFields(t *testing.T) {
 	t.Parallel()
 
-	// Lua does opts['keepJobs']['count'] without nil-guarding the
-	// outer table, so omitting keepJobs surfaces as a runtime error
-	// from Redis. The encoder must always emit at least an empty map.
+	// Two fields the vendored Lua dereferences without nil guards:
+	//   - opts['keepJobs']['count'] (moveToFinished-14.lua:104)
+	//   - opts['maxMetricsSize'] in collectMetrics → tonumber(nil)
+	//     crashes on the second invocation.
 	encoded, err := EncodeMoveToFinishedOpts(MoveToFinishedOpts{
 		Token:        "t",
 		LockDuration: 1000,
@@ -69,7 +70,13 @@ func TestEncodeMoveToFinishedOpts_AlwaysIncludesKeepJobs(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if _, ok := m["keepJobs"]; !ok {
-		t.Fatal("keepJobs must always be present in the encoded opts map")
+		t.Error("keepJobs must always be present in the encoded opts map")
+	}
+	v, ok := m["maxMetricsSize"]
+	if !ok {
+		t.Error("maxMetricsSize must always be present in the encoded opts map")
+	} else if v != "" {
+		t.Errorf("maxMetricsSize default should be empty string, got %v", v)
 	}
 }
 
