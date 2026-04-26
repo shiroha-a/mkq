@@ -9,11 +9,18 @@ Lua scripts in this directory are vendored verbatim from BullMQ.
 
 ## Files vendored
 
+Entry points:
+
 - `addStandardJob-9.lua`
 - `addDelayedJob-6.lua`
 - `addPrioritizedJob-9.lua`
-- `includes/` — every script transitively reachable from the three entry
-  points above via `--- @include "..."` directives.
+- `moveToActive-11.lua`
+- `moveToFinished-14.lua`
+- `extendLock-2.lua`
+- `releaseLock-1.lua`
+
+`includes/` — every script transitively reachable from the entry points
+above via `--- @include "..."` directives.
 
 The `-N` suffix on entry-point scripts is the BullMQ convention for the
 expected `KEYS` count and is preserved verbatim.
