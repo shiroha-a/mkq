@@ -5,10 +5,16 @@ import (
 	"time"
 )
 
-// Job represents a job that has been enqueued via Queue.Add. The struct
-// is a snapshot of the wire-level state at the moment of enqueue;
-// progress / returnvalue / state transitions are not reflected here
-// (that surface arrives with the worker API in a follow-up PR).
+// Job represents a job that has been enqueued via Queue.Add or
+// reconstructed by the worker dispatch path. The exported fields are
+// a wire-level snapshot taken at construction time and never refresh
+// in place; for the post-finalisation view of the same job (progress,
+// return value, finished/processed timestamps), call Queue.Get and
+// inspect the JobState companion.
+//
+// Mutations performed via the methods on this type (UpdateProgress,
+// UpdateData, Log) write through to Redis directly via the BullMQ
+// vendored Lua scripts; they do not update the local Job struct.
 type Job[T any] struct {
 	// ID is the BullMQ job id. Numeric for auto-allocated jobs;
 	// arbitrary string when WithJobID is used.
@@ -42,6 +48,13 @@ type Job[T any] struct {
 	// ProcessedBy is BullMQ `pb` — the worker name that most recently
 	// dequeued this job (set by prepareJobForProcessing.lua).
 	ProcessedBy string
+
+	// queue is set when the Job is constructed via a Queue path
+	// (Add / Get / handler dispatch), enabling the mutation methods
+	// (UpdateProgress / UpdateData / Log) without forcing callers to
+	// thread the queue separately. Stays nil for synthetic Jobs
+	// constructed by tests; methods then return ErrJobDetached.
+	queue *Queue[T]
 }
 
 // JobState is the post-finalisation read-only snapshot of a job's

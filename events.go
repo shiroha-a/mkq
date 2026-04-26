@@ -115,6 +115,18 @@ type RemovedEvent struct {
 	Prev  string
 }
 
+// ProgressEvent corresponds to BullMQ's `progress` event, emitted by
+// updateProgress-3.lua whenever a worker (or out-of-band caller)
+// reports a progress value via Job.UpdateProgress /
+// Queue.UpdateJobProgress. Data is the JSON-encoded progress value
+// — number, string, object — exactly as the lua wrote it to the
+// stream's `data` field.
+type ProgressEvent struct {
+	id    string
+	JobID string
+	Data  json.RawMessage
+}
+
 // RawEvent wraps any event type mkq doesn't model explicitly. Future
 // BullMQ versions can emit new event names (or mutation features land
 // in #27), and this type keeps Subscribe forward-compatible.
@@ -137,6 +149,7 @@ func (e StalledEvent) ID() string          { return e.id }
 func (e DrainedEvent) ID() string          { return e.id }
 func (e RetriesExhaustedEvent) ID() string { return e.id }
 func (e RemovedEvent) ID() string          { return e.id }
+func (e ProgressEvent) ID() string         { return e.id }
 func (e RawEvent) ID() string              { return e.id }
 
 func (AddedEvent) isQueueEvent()            {}
@@ -149,6 +162,7 @@ func (StalledEvent) isQueueEvent()          {}
 func (DrainedEvent) isQueueEvent()          {}
 func (RetriesExhaustedEvent) isQueueEvent() {}
 func (RemovedEvent) isQueueEvent()          {}
+func (ProgressEvent) isQueueEvent()         {}
 func (RawEvent) isQueueEvent()              {}
 
 // QueueEvents is a long-lived subscriber to a queue's BullMQ events
@@ -296,6 +310,12 @@ func decodeStreamMessage(msg redis.XMessage) Event {
 		return RetriesExhaustedEvent{id: msg.ID, JobID: fields["jobId"], AttemptsMade: atm}
 	case "removed":
 		return RemovedEvent{id: msg.ID, JobID: fields["jobId"], Prev: fields["prev"]}
+	case "progress":
+		return ProgressEvent{
+			id:    msg.ID,
+			JobID: fields["jobId"],
+			Data:  rawJSON(fields["data"]),
+		}
 	default:
 		// 未知 event は forward compat のため RawEvent で wrap。
 		return RawEvent{id: msg.ID, Type: fields["event"], Fields: fields}

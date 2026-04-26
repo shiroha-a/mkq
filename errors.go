@@ -23,8 +23,16 @@ var ErrPriorityWithDelay = errors.New("mkq: WithPriority cannot be combined with
 //	return fmt.Errorf("invalid input: %w", mkq.ErrUnrecoverable)
 var ErrUnrecoverable = errors.New("mkq: unrecoverable error (skip retry)")
 
-// ErrJobNotFound is returned by Queue.Get when the HASH at the
-// expected key is missing — the job either never existed, was
+// ErrJobNotFound is returned by Queue.Get and the mutation methods
+// (UpdateProgress / UpdateData / Log) when the BullMQ HASH for the
+// target jobID is missing — the job either never existed, was
 // removed via WithKeepCompleted(0), or expired from a separate
 // retention policy.
 var ErrJobNotFound = errors.New("mkq: job not found")
+
+// ErrJobDetached is returned by Job mutation methods when the Job
+// was constructed without a queue back-pointer (e.g. zero-valued
+// for tests). All Job values produced by the mkq API — Queue.Add,
+// Queue.Get, and the handler-dispatch path — carry the back-pointer
+// automatically.
+var ErrJobDetached = errors.New("mkq: job has no queue back-pointer (constructed outside mkq?)")
