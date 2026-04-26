@@ -51,6 +51,34 @@ func TestEncodeMoveToActiveOpts_OmitsEmptyName(t *testing.T) {
 	}
 }
 
+func TestEncodeMoveToFinishedOpts_KeepJobsCountZeroPreserved(t *testing.T) {
+	t.Parallel()
+
+	// Count==0 means "remove completed/failed immediately" in BullMQ.
+	// Dropping the key would make Lua read nil and fall through to the
+	// "keep all" branch — silently inverting the caller's intent.
+	encoded, err := EncodeMoveToFinishedOpts(MoveToFinishedOpts{
+		Token:        "t",
+		LockDuration: 1000,
+		KeepJobs:     &KeepJobs{Count: 0},
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var m map[string]any
+	if err := msgpack.Unmarshal(encoded, &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	keep, ok := m["keepJobs"].(map[string]any)
+	if !ok {
+		t.Fatalf("keepJobs missing or not a map: %v", m["keepJobs"])
+	}
+	got, ok := toInt64(keep["count"])
+	if !ok || got != 0 {
+		t.Errorf("keepJobs.count: expected 0, got %v (%T)", keep["count"], keep["count"])
+	}
+}
+
 func TestEncodeMoveToFinishedOpts_AlwaysIncludesNilSafeFields(t *testing.T) {
 	t.Parallel()
 

@@ -51,9 +51,10 @@ type KeepJobs struct {
 func EncodeMoveToFinishedOpts(o MoveToFinishedOpts) ([]byte, error) {
 	keep := map[string]any{}
 	if o.KeepJobs != nil {
-		if o.KeepJobs.Count > 0 {
-			keep["count"] = o.KeepJobs.Count
-		}
+		// 0 is meaningful for Count: BullMQの「即時削除」セマンティクス
+		// に対応するため、Count==0 でも emit する。一方 Age はBullMQが
+		// 0 を「制限なし」(=未設定) として扱うので omit でよい。
+		keep["count"] = o.KeepJobs.Count
 		if o.KeepJobs.Age > 0 {
 			keep["age"] = o.KeepJobs.Age
 		}

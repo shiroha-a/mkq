@@ -115,10 +115,9 @@ func TestWorker_Process_HandlerError(t *testing.T) {
 
 	h, err := rdb.HGetAll(ctx, base+addedJob.ID).Result()
 	require.NoError(t, err)
-	require.NotEmpty(t, h["failedReason"])
-	var reason string
-	require.NoError(t, json.Unmarshal([]byte(h["failedReason"]), &reason))
-	assert.Equal(t, "boom", reason)
+	// BullMQ stores failedReason as a plain string (matching err.message
+	// in the TS client), not JSON-encoded.
+	assert.Equal(t, "boom", h["failedReason"])
 }
 
 func TestWorker_Process_Panic(t *testing.T) {
@@ -149,8 +148,7 @@ func TestWorker_Process_Panic(t *testing.T) {
 
 	h, err := rdb.HGetAll(ctx, base+addedJob.ID).Result()
 	require.NoError(t, err)
-	var reason string
-	require.NoError(t, json.Unmarshal([]byte(h["failedReason"]), &reason))
+	reason := h["failedReason"]
 	assert.Contains(t, reason, "panic: kaboom")
 	assert.Contains(t, reason, "goroutine ", "stack trace must be captured")
 }

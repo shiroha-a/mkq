@@ -225,21 +225,27 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 
 // runHandler invokes the user handler with panic recovery and returns
 // the wire-level finish parameters: target ("completed" or "failed"),
-// the BullMQ msg field name ("returnvalue" or "failedReason"), and the
-// JSON-encoded value.
+// the BullMQ msg field name, and the value to write.
+//
+// BullMQ's wire format is asymmetric:
+//   - returnvalue is JSON.stringify-d (the user's return is opaque).
+//   - failedReason is the raw err.message string (no JSON quoting).
+//
+// Mirroring that asymmetry is required for bull-board and other
+// foreign readers to render error messages without spurious quotes.
 func (w *Worker) runHandler(ctx context.Context, handlerAny any, jobID string, jobMap map[string]string) (target, msgProperty, msgValue string) {
 	defer func() {
 		if r := recover(); r != nil {
 			target = "failed"
 			msgProperty = "failedReason"
 			stack := string(debug.Stack())
-			msgValue = mustJSONString(fmt.Sprintf("panic: %v\n%s", r, stack))
+			msgValue = fmt.Sprintf("panic: %v\n%s", r, stack)
 		}
 	}()
 
 	ret, err := invokeHandler(ctx, handlerAny, jobID, jobMap)
 	if err != nil {
-		return "failed", "failedReason", mustJSONString(err.Error())
+		return "failed", "failedReason", err.Error()
 	}
 	return "completed", "returnvalue", mustJSONString(ret)
 }
