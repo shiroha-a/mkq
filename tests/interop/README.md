@@ -16,6 +16,12 @@ BullMQ TS expects to consume, and vice versa".
   `bullmq.Queue.add`; the mkq `Process` worker handles it. Both the
   Go-side handler invocation and the Redis-side completed state get
   asserted.
+- **bull-board reads mkq queue state**: an Express server with the
+  BullMQ adapter mounted at `/admin` is started after mkq writes
+  jobs in completed/delayed states; the test hits
+  `/admin/api/queues` and asserts bull-board lists our queue with
+  the expected counts. If mkq's wire shape were off, the adapter
+  would either error or report wrong numbers.
 
 ## Running locally
 
