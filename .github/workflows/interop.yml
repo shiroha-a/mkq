@@ -1,0 +1,53 @@
+name: interop
+
+# Cross-language smoke tests: mkq <-> BullMQ TS bidirectional Add/Process
+# scenarios against a real Redis. Runs separately from the main CI suite
+# so a failure here doesn't block unit/integration test signal — it
+# specifically guards the BullMQ wire compat boundary.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: tests/interop/node/package-lock.json
+
+      - name: install bullmq harness deps
+        working-directory: tests/interop/node
+        run: npm ci
+
+      - name: go test interop
+        env:
+          MKQ_TEST_REDIS_ADDR: 127.0.0.1:6379
+        run: go test -tags=interop ./tests/interop/... -count=1 -timeout 90s
