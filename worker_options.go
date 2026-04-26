@@ -10,6 +10,8 @@ type workerConfig struct {
 	lockDuration     time.Duration
 	workerName       string
 	idlePollInterval time.Duration
+	stalledInterval  time.Duration
+	maxStalledCount  int
 }
 
 // Defaults mirror BullMQ where applicable.
@@ -17,6 +19,8 @@ const (
 	defaultConcurrency      = 1
 	defaultLockDuration     = 30 * time.Second
 	defaultIdlePollInterval = 100 * time.Millisecond
+	defaultStalledInterval  = 30 * time.Second
+	defaultMaxStalledCount  = 1
 )
 
 // WithConcurrency sets the number of in-flight jobs the worker will
@@ -46,4 +50,24 @@ func WithWorkerName(name string) WorkerOption {
 // is the temporary substitute.
 func WithIdlePollInterval(d time.Duration) WorkerOption {
 	return func(c *workerConfig) { c.idlePollInterval = d }
+}
+
+// WithStalledInterval controls how often each Worker scans for jobs
+// whose lock has expired (a worker that crashed or lost its Redis
+// connection). The Lua's stalled-check key TTL is set to this value
+// so concurrent workers serialise the scan.
+//
+// BullMQ's default is 30s and works well for most production setups;
+// shorter intervals shorten the recovery window at the cost of more
+// Redis traffic.
+func WithStalledInterval(d time.Duration) WorkerOption {
+	return func(c *workerConfig) { c.stalledInterval = d }
+}
+
+// WithMaxStalledCount sets how many times a single job may be
+// reclaimed by stalled detection before BullMQ marks it as failed
+// outright (HASH `defa` = "job stalled more than allowable limit").
+// Default 1 matches BullMQ.
+func WithMaxStalledCount(n int) WorkerOption {
+	return func(c *workerConfig) { c.maxStalledCount = n }
 }

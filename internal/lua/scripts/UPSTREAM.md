@@ -20,6 +20,7 @@ Entry points:
 - `releaseLock-1.lua`
 - `retryJob-11.lua`
 - `moveToDelayed-12.lua`
+- `moveStalledJobsToWait-8.lua`
 
 `includes/` — every script transitively reachable from the entry points
 above via `--- @include "..."` directives.

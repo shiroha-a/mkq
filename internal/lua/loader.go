@@ -16,15 +16,16 @@ type ScriptName string
 // Vendored entry-point scripts. The numeric suffix mirrors BullMQ's
 // convention of encoding the expected KEYS count in the filename.
 const (
-	AddStandardJob    ScriptName = "addStandardJob-9"
-	AddDelayedJob     ScriptName = "addDelayedJob-6"
-	AddPrioritizedJob ScriptName = "addPrioritizedJob-9"
-	MoveToActive      ScriptName = "moveToActive-11"
-	MoveToFinished    ScriptName = "moveToFinished-14"
-	ExtendLock        ScriptName = "extendLock-2"
-	ReleaseLock       ScriptName = "releaseLock-1"
-	RetryJob          ScriptName = "retryJob-11"
-	MoveToDelayed     ScriptName = "moveToDelayed-12"
+	AddStandardJob        ScriptName = "addStandardJob-9"
+	AddDelayedJob         ScriptName = "addDelayedJob-6"
+	AddPrioritizedJob     ScriptName = "addPrioritizedJob-9"
+	MoveToActive          ScriptName = "moveToActive-11"
+	MoveToFinished        ScriptName = "moveToFinished-14"
+	ExtendLock            ScriptName = "extendLock-2"
+	ReleaseLock           ScriptName = "releaseLock-1"
+	RetryJob              ScriptName = "retryJob-11"
+	MoveToDelayed         ScriptName = "moveToDelayed-12"
+	MoveStalledJobsToWait ScriptName = "moveStalledJobsToWait-8"
 )
 
 // Scripter executes vendored Lua scripts via EVALSHA, with transparent
@@ -54,7 +55,7 @@ func NewScripter(ctx context.Context, client redis.Scripter) (*Scripter, error) 
 	for _, name := range []ScriptName{
 		AddStandardJob, AddDelayedJob, AddPrioritizedJob,
 		MoveToActive, MoveToFinished, ExtendLock, ReleaseLock,
-		RetryJob, MoveToDelayed,
+		RetryJob, MoveToDelayed, MoveStalledJobsToWait,
 	} {
 		if _, err := s.load(ctx, name); err != nil {
 			return nil, fmt.Errorf("preload %s: %w", name, err)

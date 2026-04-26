@@ -45,6 +45,10 @@ func (b Builder) Failed() string      { return b.Base() + "failed" }
 func (b Builder) Paused() string      { return b.Base() + "paused" }
 func (b Builder) Stalled() string     { return b.Base() + "stalled" }
 
+// StalledCheck is BullMQ's per-queue TTL guard preventing concurrent
+// workers from all running the stalled scan simultaneously.
+func (b Builder) StalledCheck() string { return b.Base() + "stalled-check" }
+
 // Meta is the queue-global HASH (paused flag, limiter config, etc.).
 func (b Builder) Meta() string { return b.Base() + "meta" }
 
