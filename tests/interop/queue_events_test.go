@@ -4,7 +4,7 @@ package interop_test
 
 import (
 	"context"
-	"sync"
+	"errors"
 	"testing"
 	"time"
 
@@ -37,19 +37,28 @@ func TestInterop_QueueEvents_ObservesBullMQTSEmissions(t *testing.T) {
 	}
 	var got capture
 	done := make(chan struct{})
-	var doneOnce sync.Once
+	// errStop is a sentinel returned by the handler after the first
+	// completed/failed capture so Subscribe exits immediately. This
+	// removes any post-capture concurrent write to `got` from the
+	// subscriber goroutine while the test's main goroutine reads it.
+	errStop := errors.New("interop: stop after first terminal event")
 	go func() {
-		_ = qe.Subscribe(context.Background(), func(ev mkq.Event) error {
+		err := qe.Subscribe(context.Background(), func(ev mkq.Event) error {
 			switch e := ev.(type) {
 			case mkq.CompletedEvent:
 				got.completed = &e
-				doneOnce.Do(func() { close(done) })
+				close(done)
+				return errStop
 			case mkq.FailedEvent:
 				got.failed = &e
-				doneOnce.Do(func() { close(done) })
+				close(done)
+				return errStop
 			}
 			return nil
 		})
+		if err != nil && !errors.Is(err, errStop) {
+			t.Errorf("Subscribe returned unexpected error: %v", err)
+		}
 	}()
 	// Let the BLOCK-XREAD register before BullMQ TS starts emitting.
 	time.Sleep(100 * time.Millisecond)

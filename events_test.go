@@ -177,8 +177,8 @@ func TestQueueEvents_DelayedEvent(t *testing.T) {
 	d, ok := findFirst[mkq.DelayedEvent](got)
 	require.True(t, ok)
 	// BullMQ Lua emits delay as the absolute target ms timestamp.
-	assert.Greater(t, d.DelayMs, time.Now().UnixMilli()-1000,
-		"delayed event delay should be a current-or-future ms timestamp, got %d", d.DelayMs)
+	assert.Greater(t, d.DelayedUntilMs, time.Now().UnixMilli()-1000,
+		"delayed event target should be a current-or-future ms timestamp, got %d", d.DelayedUntilMs)
 }
 
 // TestQueueEvents_HandlerError pins that returning a non-nil error

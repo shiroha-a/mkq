@@ -72,12 +72,14 @@ type FailedEvent struct {
 }
 
 // DelayedEvent corresponds to BullMQ's `delayed` event (addDelayedJob,
-// moveToDelayed). DelayMs is the absolute target timestamp (ms epoch)
-// when the job becomes eligible.
+// moveToDelayed). DelayedUntilMs is the absolute target timestamp
+// (ms since unix epoch) at which the job becomes eligible to run —
+// not a relative duration. The Lua-emitted `delay` field carries
+// this absolute value, hence the renamed Go field.
 type DelayedEvent struct {
-	id      string
-	JobID   string
-	DelayMs int64
+	id             string
+	JobID          string
+	DelayedUntilMs int64
 }
 
 // StalledEvent corresponds to BullMQ's `stalled` event
@@ -105,10 +107,12 @@ type RetriesExhaustedEvent struct {
 }
 
 // RemovedEvent corresponds to BullMQ's `removed` event (deduplicateJob
-// and similar paths that drop a job key).
+// and similar paths that drop a job key). Prev describes the state
+// the job left when removed (e.g. "delayed").
 type RemovedEvent struct {
 	id    string
 	JobID string
+	Prev  string
 }
 
 // RawEvent wraps any event type mkq doesn't model explicitly. Future
@@ -282,7 +286,7 @@ func decodeStreamMessage(msg redis.XMessage) Event {
 		}
 	case "delayed":
 		delay, _ := strconv.ParseInt(fields["delay"], 10, 64)
-		return DelayedEvent{id: msg.ID, JobID: fields["jobId"], DelayMs: delay}
+		return DelayedEvent{id: msg.ID, JobID: fields["jobId"], DelayedUntilMs: delay}
 	case "stalled":
 		return StalledEvent{id: msg.ID, JobID: fields["jobId"]}
 	case "drained":
@@ -291,7 +295,7 @@ func decodeStreamMessage(msg redis.XMessage) Event {
 		atm, _ := strconv.Atoi(fields["attemptsMade"])
 		return RetriesExhaustedEvent{id: msg.ID, JobID: fields["jobId"], AttemptsMade: atm}
 	case "removed":
-		return RemovedEvent{id: msg.ID, JobID: fields["jobId"]}
+		return RemovedEvent{id: msg.ID, JobID: fields["jobId"], Prev: fields["prev"]}
 	default:
 		// 未知 event は forward compat のため RawEvent で wrap。
 		return RawEvent{id: msg.ID, Type: fields["event"], Fields: fields}
