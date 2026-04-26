@@ -49,9 +49,9 @@ func WithScheduleStartDate(t time.Time) ScheduleOption {
 }
 
 // WithScheduleTimezone sets the IANA timezone (e.g. "Asia/Tokyo")
-// in which a cron pattern is evaluated. Pattern-mode only; ignored
-// for fixed-interval schedules. Empty string = local time, matching
-// BullMQ's default when `tz` is omitted.
+// in which a cron pattern is evaluated. Pattern-mode only; passing
+// it to UpsertScheduleEvery returns an error. Empty string = local
+// time, matching BullMQ's default when `tz` is omitted.
 func WithScheduleTimezone(tz string) ScheduleOption {
 	return func(c *scheduleConfig) { c.tz = tz }
 }

@@ -27,6 +27,11 @@ var cronParser = cron.NewParser(
 // Schedules are immutable post-compile and shared safely across
 // goroutines; the cache leaks across the process lifetime by design
 // — pattern strings in a typical app are finite and small.
+//
+// Key encoding uses "|" as the pattern/tz separator. The documented
+// v1 cron subset (5 fields + standard descriptors) never contains
+// "|", so collisions are impossible; cronParser also rejects any
+// expression that would.
 var cronCache sync.Map // key: "<pattern>|<tz>" -> *cachedCron
 
 type cachedCron struct {
@@ -75,8 +80,10 @@ func parseCron(pattern, tz string) (*cachedCron, error) {
 	return actual.(*cachedCron), nil
 }
 
-// nextFire returns the next fire time at or after `from`, in the
-// schedule's timezone.
+// nextFire returns the next fire time strictly after `from`, in the
+// schedule's timezone. This matches BullMQ's cron-parser, whose
+// `interval.next()` also advances past the input time even if it
+// already matches the pattern.
 func (c *cachedCron) nextFire(from time.Time) time.Time {
 	return c.schedule.Next(from.In(c.loc))
 }
