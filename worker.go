@@ -333,7 +333,7 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 	jobOpts := parseJobOpts(jobMap["opts"])
 
 	if out.success {
-		return w.finishCompleted(jobID, token, jobOpts.attempts, out.returnValue)
+		return w.finishCompleted(jobID, token, jobOpts, out.returnValue)
 	}
 
 	// Decide retry. Reading from the in-memory jobMap snapshot is fine
@@ -342,11 +342,11 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 	// we re-read it (via jobMap, which is the HGETALL captured at
 	// moveToActive). For BullMQ-correctness this is sufficient because
 	// stalled-recovery — the only way `atm` advances without us
-	// observing it — is not yet implemented.
+	// observing it — is not yet implemented (tracked in #13).
 	atm := parseInt(jobMap["atm"])
 
 	if !w.shouldRetry(jobOpts, atm, out.err) {
-		return w.finishFailed(jobID, token, jobOpts.attempts, out.errReason, out.stacktrace)
+		return w.finishFailed(jobID, token, jobOpts, out.errReason, out.stacktrace)
 	}
 
 	delay := computeBackoffDelay(jobOpts.backoff, atm+1)
@@ -357,32 +357,41 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 }
 
 // finishCompleted writes the BullMQ completed-state transition.
-func (w *Worker) finishCompleted(jobID, token string, attempts int, returnValue string) error {
-	return w.runMoveToFinished(jobID, token, attempts, "completed", "returnvalue", returnValue, nil)
+// jobOpts.removeOnComplete is forwarded into MoveToFinishedOpts.KeepJobs
+// so the vendored Lua trims the completed ZSET per BullMQ semantics.
+func (w *Worker) finishCompleted(jobID, token string, opts jobOpts, returnValue string) error {
+	return w.runMoveToFinished(jobID, token, opts.attempts, opts.removeOnComplete,
+		"completed", "returnvalue", returnValue, nil)
 }
 
 // finishFailed writes the BullMQ failed-state transition with the
 // failedReason + stacktrace HASH fields. attempts is forwarded so the
 // vendored Lua only emits `retries-exhausted` when retries are
-// genuinely exhausted (matching BullMQ TS behaviour for foreign
-// readers of the events stream).
-func (w *Worker) finishFailed(jobID, token string, attempts int, reason, stacktrace string) error {
-	return w.runMoveToFinished(jobID, token, attempts, "failed", "failedReason", reason,
+// genuinely exhausted; jobOpts.removeOnFail drives failed ZSET
+// retention.
+func (w *Worker) finishFailed(jobID, token string, opts jobOpts, reason, stacktrace string) error {
+	return w.runMoveToFinished(jobID, token, opts.attempts, opts.removeOnFail,
+		"failed", "failedReason", reason,
 		[]any{"stacktrace", stacktrace})
 }
 
 // runMoveToFinished is the shared moveToFinished invocation. extraFields
 // piggybacks on ARGV[9] for the failed path to write stacktrace
-// alongside the state change.
-func (w *Worker) runMoveToFinished(jobID, token string, attempts int, target, msgProperty, msgValue string, extraFields []any) error {
+// alongside the state change. keepCount is the per-target retention
+// (nil = keep all, *0 = remove immediately, *n>0 = keep last n).
+func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keepCount *int, target, msgProperty, msgValue string, extraFields []any) error {
 	now := time.Now().UnixMilli()
 
-	optsBytes, err := proto.EncodeMoveToFinishedOpts(proto.MoveToFinishedOpts{
+	optsArgs := proto.MoveToFinishedOpts{
 		Token:        token,
 		LockDuration: w.cfg.lockDuration.Milliseconds(),
 		Attempts:     attempts,
 		Name:         w.cfg.workerName,
-	})
+	}
+	if keepCount != nil {
+		optsArgs.KeepJobs = &proto.KeepJobs{Count: *keepCount}
+	}
+	optsBytes, err := proto.EncodeMoveToFinishedOpts(optsArgs)
 	if err != nil {
 		return fmt.Errorf("encode finish opts: %w", err)
 	}
@@ -498,39 +507,119 @@ func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason, 
 // needs after dequeue. The on-Redis HASH `opts` field is the JSON
 // shape produced by Job.optsAsJSON in BullMQ TS.
 type jobOpts struct {
-	attempts int
-	backoff  *BackoffStrategy
-	lifo     bool
+	attempts         int
+	backoff          *BackoffStrategy
+	lifo             bool
+	removeOnComplete *int
+	removeOnFail     *int
 }
 
 // parseJobOpts deserialises the BullMQ HASH `opts` JSON into the
-// fields the retry path needs. Missing or malformed input falls back
-// to zero values (no retry / no backoff / FIFO push).
+// fields the retry / retention paths need.
+//
+// BullMQ TypeScript stores several option fields polymorphically:
+//
+//   - removeOnComplete / removeOnFail accept `boolean | number |
+//     {count, age}` and are persisted as-is.
+//   - backoff accepts `number | {type, delay}` and is persisted
+//     without normalisation (Backoffs.normalize runs at retry-time).
+//
+// Decoding these as concrete Go types would surface a
+// json.UnmarshalTypeError on the first foreign-style entry and
+// poison the entire opts struct, silently disabling retry for jobs
+// added by other-language workers. Instead we capture each
+// polymorphic field as json.RawMessage and convert per field below,
+// so a typing surprise only loses that one option.
+//
+// Missing or malformed top-level JSON falls back to zero values
+// (no retry / no backoff / FIFO push / keep all).
 func parseJobOpts(raw string) jobOpts {
 	var out jobOpts
 	if raw == "" || raw == "{}" {
 		return out
 	}
 	var m struct {
-		Attempts int  `json:"attempts"`
-		Lifo     bool `json:"lifo"`
-		Backoff  *struct {
-			Type  string `json:"type"`
-			Delay int64  `json:"delay"`
-		} `json:"backoff"`
+		Attempts         int             `json:"attempts"`
+		Lifo             bool            `json:"lifo"`
+		Backoff          json.RawMessage `json:"backoff"`
+		RemoveOnComplete json.RawMessage `json:"removeOnComplete"`
+		RemoveOnFail     json.RawMessage `json:"removeOnFail"`
 	}
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
 		return out
 	}
 	out.attempts = m.Attempts
 	out.lifo = m.Lifo
-	if m.Backoff != nil {
-		out.backoff = &BackoffStrategy{
-			Type:  m.Backoff.Type,
-			Delay: time.Duration(m.Backoff.Delay) * time.Millisecond,
+	out.backoff = parseBackoffOpt(m.Backoff)
+	out.removeOnComplete = parseRemoveOpt(m.RemoveOnComplete)
+	out.removeOnFail = parseRemoveOpt(m.RemoveOnFail)
+	return out
+}
+
+// parseRemoveOpt converts a BullMQ removeOnComplete / removeOnFail
+// raw JSON value into the count form mkq cares about.
+//
+//	null / missing / false   -> nil  (BullMQ default: keep all)
+//	true                     -> *int(0)  (remove on completion)
+//	number N                 -> *int(N)
+//	{"count": N, ...}        -> *int(N)  (age / limit ignored for now)
+//
+// Anything else is treated as "not understood" and returns nil so
+// retry / retention default cleanly.
+func parseRemoveOpt(raw json.RawMessage) *int {
+	if len(raw) == 0 {
+		return nil
+	}
+	s := string(raw)
+	switch s {
+	case "null", "false":
+		return nil
+	case "true":
+		v := 0
+		return &v
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return &n
+	}
+	var obj struct {
+		Count *int `json:"count"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.Count != nil {
+		return obj.Count
+	}
+	return nil
+}
+
+// parseBackoffOpt accepts BullMQ's `number | {type, delay}` shape:
+//
+//	number N           -> &BackoffStrategy{Type:"fixed", Delay: N ms}
+//	{type, delay}      -> &BackoffStrategy{Type, Delay}
+//
+// Empty / null / unrecognised shapes return nil so callers fall back
+// to the no-backoff default.
+func parseBackoffOpt(raw json.RawMessage) *BackoffStrategy {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var ms int64
+	if err := json.Unmarshal(raw, &ms); err == nil {
+		return &BackoffStrategy{
+			Type:  "fixed",
+			Delay: time.Duration(ms) * time.Millisecond,
 		}
 	}
-	return out
+	var obj struct {
+		Type  string `json:"type"`
+		Delay int64  `json:"delay"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.Type != "" {
+		return &BackoffStrategy{
+			Type:  obj.Type,
+			Delay: time.Duration(obj.Delay) * time.Millisecond,
+		}
+	}
+	return nil
 }
 
 // shouldRetry encodes BullMQ's worker-side retry decision. attemptsMade

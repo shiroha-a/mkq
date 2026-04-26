@@ -158,10 +158,12 @@ func (q *Queue[T]) dispatch(delayMs int64, priority uint32) (lua.ScriptName, []s
 // to derive the absolute delayed target.
 func toProtoOpts(cfg addConfig, delayMs int64) proto.AddOpts {
 	o := proto.AddOpts{
-		Delay:    delayMs,
-		Priority: cfg.priority,
-		Attempts: cfg.attempts,
-		Lifo:     cfg.lifo,
+		Delay:            delayMs,
+		Priority:         cfg.priority,
+		Attempts:         cfg.attempts,
+		Lifo:             cfg.lifo,
+		RemoveOnComplete: cfg.keepCompleted,
+		RemoveOnFail:     cfg.keepFailed,
 	}
 	if cfg.backoff != nil {
 		o.Backoff = &proto.Backoff{
