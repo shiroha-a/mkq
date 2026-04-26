@@ -6,10 +6,14 @@
   "type": "module",
   "scripts": {
     "worker": "node worker.js",
-    "enqueuer": "node enqueuer.js"
+    "enqueuer": "node enqueuer.js",
+    "bullboard": "node bullboard.js"
   },
   "dependencies": {
+    "@bull-board/api": "6.13.1",
+    "@bull-board/express": "6.13.1",
     "bullmq": "5.76.2",
+    "express": "4.21.2",
     "ioredis": "5.10.1"
   }
 }
