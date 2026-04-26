@@ -840,8 +840,10 @@ func parseMoveToActiveResult(res any) (jobMap map[string]string, jobID string, o
 	return m, id, true, 0, nil
 }
 
-// toInt64 normalises the integer types go-redis returns from EVALSHA
-// (int64 / int / json.Number) to int64.
+// toInt64 normalises the integer types go-redis can surface for an
+// EVALSHA result element (int64 / int / int32 / float64) to int64.
+// In practice go-redis v9 returns int64 for Lua integer returns;
+// the other cases stay covered for forward compatibility.
 func toInt64(v any) (int64, bool) {
 	switch n := v.(type) {
 	case int64:

@@ -85,6 +85,13 @@ func WithMaxStalledCount(n int) WorkerOption {
 // exactly that long before its next moveToActive attempt.
 //
 // max <= 0 or duration <= 0 disables rate limiting (the default).
+//
+// Precedence note: BullMQ also supports a queue-level rate limit
+// stored in the meta HASH (`max` / `duration` keys). The vendored
+// moveToActive Lua reads that first and falls back to opts.limiter,
+// so a queue-level setting written by another client (e.g. a
+// BullMQ TS admin) silently overrides WithRateLimit. mkq does not
+// yet expose a public API to write the meta keys.
 func WithRateLimit(max int, duration time.Duration) WorkerOption {
 	return func(c *workerConfig) {
 		if max <= 0 || duration <= 0 {
