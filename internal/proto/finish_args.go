@@ -12,9 +12,10 @@ import (
 //
 // The Lua reads opts['token'] / opts['lockDuration'] for ownership
 // validation, opts['attempts'] for retry decisions, opts['keepJobs']
-// for retention trimming, and opts['name'] for attribution. Worker
-// fields the basic happy-path doesn't expose (fpof, cpof, idof, rdof,
-// maxMetricsSize) stay omitted.
+// for retention trimming, opts['name'] for attribution, and
+// opts['maxMetricsSize'] for the per-minute metrics write path.
+// Worker fields the basic happy-path doesn't expose (fpof, cpof,
+// idof, rdof) stay omitted.
 type MoveToFinishedOpts struct {
 	Token        string
 	LockDuration int64
