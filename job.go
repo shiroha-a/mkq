@@ -19,8 +19,9 @@ type Job[T any] struct {
 	// ID is the BullMQ job id. Numeric for auto-allocated jobs;
 	// arbitrary string when WithJobID is used.
 	ID string
-	// Name is the BullMQ job name. mkq sets this to the queue name
-	// today; future work may expose per-Add naming.
+	// Name is the BullMQ job name. Defaults to the queue name; can
+	// be overridden per Add via WithJobName, which is the recommended
+	// way to fan one queue out across multiple task types.
 	Name string
 	// Data is the user payload, as it was passed to Add.
 	Data T
