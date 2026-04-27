@@ -62,36 +62,41 @@ type KeepJobs struct {
 //     ""` permitted entry. BullMQ TypeScript sends "" when metrics
 //     are disabled; mkq mirrors that.
 func EncodeMoveToFinishedOpts(o MoveToFinishedOpts) ([]byte, error) {
-	keep := map[string]any{}
-	if o.KeepJobs != nil {
-		// Count==nil omits the count key, leaving Lua's
-		// `opts['keepJobs']['count']` as nil (treated as unbounded).
-		// Count==*0 explicitly emits 0 (BullMQの「即時削除」). Age
-		// is omitted when zero because BullMQ treats 0 as unset.
-		if o.KeepJobs.Count != nil {
-			keep["count"] = *o.KeepJobs.Count
+	// Hot path: invoked once per finalised job. Uses the package
+	// encoder pool (pool.go) so msgpack.Encoder + bytes.Buffer are
+	// reused — only the returned byte slice allocates per call.
+	return encodeMsgpack(func(enc *msgpack.Encoder) error {
+		keep := map[string]any{}
+		if o.KeepJobs != nil {
+			// Count==nil omits the count key, leaving Lua's
+			// `opts['keepJobs']['count']` as nil (treated as unbounded).
+			// Count==*0 explicitly emits 0 (BullMQの「即時削除」). Age
+			// is omitted when zero because BullMQ treats 0 as unset.
+			if o.KeepJobs.Count != nil {
+				keep["count"] = *o.KeepJobs.Count
+			}
+			if o.KeepJobs.Age > 0 {
+				keep["age"] = o.KeepJobs.Age
+			}
 		}
-		if o.KeepJobs.Age > 0 {
-			keep["age"] = o.KeepJobs.Age
+		m := map[string]any{
+			"token":          o.Token,
+			"lockDuration":   o.LockDuration,
+			"attempts":       o.Attempts,
+			"keepJobs":       keep,
+			"maxMetricsSize": "",
 		}
-	}
-	m := map[string]any{
-		"token":          o.Token,
-		"lockDuration":   o.LockDuration,
-		"attempts":       o.Attempts,
-		"keepJobs":       keep,
-		"maxMetricsSize": "",
-	}
-	if o.Name != "" {
-		m["name"] = o.Name
-	}
-	if l := o.Limiter; l != nil && l.Max > 0 && l.DurationMs > 0 {
-		m["limiter"] = map[string]any{
-			"max":      l.Max,
-			"duration": l.DurationMs,
+		if o.Name != "" {
+			m["name"] = o.Name
 		}
-	}
-	return msgpack.Marshal(m)
+		if l := o.Limiter; l != nil && l.Max > 0 && l.DurationMs > 0 {
+			m["limiter"] = map[string]any{
+				"max":      l.Max,
+				"duration": l.DurationMs,
+			}
+		}
+		return enc.Encode(m)
+	})
 }
 
 // EncodeJobFields packs ARGV[9] of moveToFinished — extra HASH fields
@@ -110,7 +115,11 @@ func EncodeJobFields(pairs ...any) ([]byte, error) {
 	if len(pairs) == 0 {
 		return nil, nil
 	}
-	return msgpack.Marshal(pairs)
+	// Hot path on the failed-job branch (pairs typically [stacktrace,
+	// <stack>]) plus the retry path. Uses the package encoder pool.
+	return encodeMsgpack(func(enc *msgpack.Encoder) error {
+		return enc.Encode(pairs)
+	})
 }
 
 var errOddJobFields = errors.New("proto: EncodeJobFields requires an even number of arguments")

@@ -35,19 +35,26 @@ type MoveToActiveLimiter struct {
 }
 
 // EncodeMoveToActiveOpts returns the msgpack-encoded ARGV[3] payload.
+//
+// Hot path: invoked once per dispatch in tryOnce. Uses the package
+// encoder pool (pool.go) so the per-call allocation is the returned
+// byte slice only — msgpack.Encoder + bytes.Buffer are reused
+// across calls.
 func EncodeMoveToActiveOpts(o MoveToActiveOpts) ([]byte, error) {
-	m := map[string]any{
-		"token":        o.Token,
-		"lockDuration": o.LockDuration,
-	}
-	if o.Name != "" {
-		m["name"] = o.Name
-	}
-	if o.Limiter != nil {
-		m["limiter"] = map[string]any{
-			"max":      o.Limiter.Max,
-			"duration": o.Limiter.DurationMs,
+	return encodeMsgpack(func(enc *msgpack.Encoder) error {
+		m := map[string]any{
+			"token":        o.Token,
+			"lockDuration": o.LockDuration,
 		}
-	}
-	return msgpack.Marshal(m)
+		if o.Name != "" {
+			m["name"] = o.Name
+		}
+		if o.Limiter != nil {
+			m["limiter"] = map[string]any{
+				"max":      o.Limiter.Max,
+				"duration": o.Limiter.DurationMs,
+			}
+		}
+		return enc.Encode(m)
+	})
 }
