@@ -201,6 +201,14 @@ type prefetchedJob struct {
 func (w *Worker) dispatchLoop(handlerAny any) {
 	defer w.run.Done()
 	var prefetched *prefetchedJob
+	defer func() {
+		// shutdown race: fetchNextFlag may have returned "1" between
+		// our last ctx check and the EVAL, leaving us with a locked
+		// prefetched job we're about to drop. Release the lock so it
+		// doesn't sit in active for the full lockDuration +
+		// stalledInterval until stalled-recovery picks it up.
+		w.releasePrefetchedLock(prefetched)
+	}()
 	for {
 		if w.runCtx.Err() != nil {
 			return
@@ -838,7 +846,7 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *rete
 		msgProperty,
 		msgValue,
 		target,
-		"1", // fetchNext=true: opportunistically grab the next job under the same token
+		w.fetchNextFlag(),
 		w.keys.prefix,
 		optsBytes,
 		jobFields,
@@ -866,6 +874,45 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *rete
 		return nil, nil
 	}
 	return &prefetchedJob{jobMap: jobMap, jobID: prefetchedID, token: token}, nil
+}
+
+// fetchNextFlag returns the BullMQ ARGV[6] sentinel for moveToFinished:
+// "1" enables the fetchNext optimisation, "" disables it. We must
+// disable when runCtx is cancelled, otherwise the lua's fetchNextJob
+// path would lock a fresh job that the worker is about to abandon
+// (dispatchLoop's exit guard wouldn't process it). The locked job
+// would then sit in active for `lockDuration + stalledInterval`
+// before stalled-recovery reclaims it. Mirrors BullMQ TS's
+// `!this.closing` gate at moveToFinished call sites.
+//
+// Race window: ctx can be cancelled between this check and the EVAL
+// reaching Redis, in which case one job slips through and ends up
+// abandoned. dispatchLoop's deferred cleanup releases the lock for
+// any prefetched job the dispatcher holds at exit, narrowing that
+// window to the in-flight EVAL plus a single dispatch hop.
+func (w *Worker) fetchNextFlag() string {
+	if w.runCtx.Err() != nil {
+		return ""
+	}
+	return "1"
+}
+
+// releasePrefetchedLock drops the lock the lua acquired for the
+// prefetched job before the dispatcher exited. Best-effort: if the
+// release fails (Redis hiccup, lock already expired) the lock TTL
+// will eventually clear it via stalled-recovery. The deferred call
+// in dispatchLoop guarantees this runs even on panic.
+func (w *Worker) releasePrefetchedLock(pj *prefetchedJob) {
+	if pj == nil {
+		return
+	}
+	_, _ = w.scripts.Run(
+		context.Background(),
+		lua.ReleaseLock,
+		[]string{w.keys.jobLock(pj.jobID)},
+		pj.token,
+		w.cfg.lockDuration.Milliseconds(),
+	)
 }
 
 // retryImmediate re-enqueues a failed job via retryJob-11.lua. The Lua

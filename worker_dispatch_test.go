@@ -11,6 +11,72 @@ import (
 	"github.com/shiroha-a/mkq"
 )
 
+// TestWorker_Shutdown_ReleasesPrefetchedLock pins the safety guard
+// for the moveToFinished fetchNext path: when the worker shuts down
+// mid-stream, any job the lua locked as a prefetch but the
+// dispatcher never consumed must be unlocked at exit. Without the
+// guard, locked-but-abandoned jobs sit in active for
+// `lockDuration + stalledInterval` before stalled-recovery reclaims
+// them — multiplied by WithConcurrency(N) on every Stop call.
+//
+// Setup: pre-enqueue many jobs, start a worker with a short
+// blocking handler, trigger Stop while the handler is in flight.
+// After Stop returns, no job should still hold a non-expired lock.
+func TestWorker_Shutdown_ReleasesPrefetchedLock(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const seed = 50
+	for range seed {
+		_, err := queue.Add(ctx, testPayload{})
+		require.NoError(t, err)
+	}
+
+	handlerEntered := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		select {
+		case handlerEntered <- struct{}{}:
+		default:
+		}
+		<-releaseHandler
+		return nil, nil
+	},
+		mkq.WithConcurrency(4),
+		mkq.WithIdlePollInterval(20*time.Millisecond),
+	)
+	require.NoError(t, err)
+
+	<-handlerEntered
+
+	// Release in-flight handlers so processJob can finish; then Stop
+	// with a tight deadline so the dispatchLoop exit path runs while
+	// fetchNext-prefetched jobs may still be in flight.
+	close(releaseHandler)
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stopCancel()
+	require.NoError(t, worker.Stop(stopCtx))
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+
+	// Inspect any job that ended up in active. Each must NOT have a
+	// live lock (i.e. the dispatcher's deferred cleanup released it).
+	activeIDs, err := rdb.LRange(ctx, base+"active", 0, -1).Result()
+	require.NoError(t, err)
+	for _, id := range activeIDs {
+		exists, err := rdb.Exists(ctx, base+id+":lock").Result()
+		require.NoError(t, err)
+		assert.EqualValues(t, 0, exists,
+			"job %s remained locked after shutdown — fetchNext-prefetched abandon", id)
+	}
+}
+
 // TestWorker_DelayedDispatch_PreciseWakeup proves the dispatchLoop's
 // nextDelayedTs branch interprets the Lua's value as a raw
 // millisecond timestamp (not as BullMQ's packed delayed-ZSET score).
