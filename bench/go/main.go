@@ -65,7 +65,7 @@ func main() {
 	case "consume":
 		runConsume(ctx, queue, *jobs, *concurrency)
 	case "latency":
-		runLatency(ctx, queue, *jobs, *concurrency, *prefix, *queueName, *addr)
+		runLatency(ctx, queue, *jobs, *concurrency)
 	default:
 		fmt.Fprintln(os.Stderr, "missing -mode (produce | consume | latency)")
 		os.Exit(2)
@@ -138,7 +138,7 @@ func runConsume(ctx context.Context, queue *mkq.Queue[payload], n int, concurren
 // We push once up front (so the worker doesn't bottleneck on enqueue
 // rate) then start the worker; e2e then captures dispatcher polling +
 // dequeue latency on top of push pipeline cost.
-func runLatency(ctx context.Context, queue *mkq.Queue[payload], n int, concurrency int, prefix, queueName, addr string) {
+func runLatency(ctx context.Context, queue *mkq.Queue[payload], n int, concurrency int) {
 	addedAt := make(map[string]time.Time, n)
 	var addedMu sync.Mutex
 
@@ -200,9 +200,6 @@ func runLatency(ctx context.Context, queue *mkq.Queue[payload], n int, concurren
 		"p50ms":       p50.Milliseconds(),
 		"p99ms":       p99.Milliseconds(),
 	}))
-	_ = prefix
-	_ = queueName
-	_ = addr
 }
 
 // addRuntime augments a result map with Go-runtime self-observed memory

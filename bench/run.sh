@@ -39,6 +39,8 @@ TIMEBIN=/usr/bin/time
 export GOTOOLCHAIN="${GOTOOLCHAIN:-go1.25.0}"
 
 GO_BIN="$(mktemp -d)/mkqbench"
+STDERR_LOG=/tmp/mkqbench-stderr.log
+: > "$STDERR_LOG" # truncate per-run so累積しない
 trap 'rm -rf "$(dirname "$GO_BIN")"' EXIT
 echo "==> compiling mkq bench" >&2
 go build -o "$GO_BIN" ./bench/go
@@ -68,7 +70,7 @@ run_one() {
   jsonfile="$(mktemp)"
 
   set +e
-  "$TIMEBIN" -v -o "$timefile" "$bin" "$@" >"$jsonfile" 2>>/tmp/mkqbench-stderr.log
+  "$TIMEBIN" -v -o "$timefile" "$bin" "$@" >"$jsonfile" 2>>"$STDERR_LOG"
   local rc=$?
   set -e
   if [[ $rc -ne 0 ]]; then
