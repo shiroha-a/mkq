@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync/atomic"
@@ -115,29 +114,16 @@ func startNodeWorker(t *testing.T, prefix, queueName string) {
 	startNodeWorkerOpts(t, prefix, queueName, nodeWorkerOpts{})
 }
 
-// runNodeEnqueuer runs enqueuer.js once and returns the Job ID it
-// reported. Synchronous: returns after the subprocess exits.
+// runNodeEnqueuer runs enqueuer.js once with default options and
+// returns the Job ID it reported. Synchronous: returns after the
+// subprocess exits.
+//
+// Thin wrapper over runNodeEnqueuerOpts so the exec / env / JSON-parse
+// machinery lives in exactly one place; PR #5–#46's existing tests
+// keep using this short signature.
 func runNodeEnqueuer(t *testing.T, prefix, queueName, payloadJSON string) string {
 	t.Helper()
-	dir := nodeDir(t)
-	cmd := exec.Command("node", "enqueuer.js")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"INTEROP_REDIS="+redisAddr(),
-		"INTEROP_PREFIX="+prefix,
-		"INTEROP_QUEUE="+queueName,
-		"INTEROP_PAYLOAD="+payloadJSON,
-	)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.Output()
-	require.NoError(t, err, "enqueuer.js failed")
-
-	var msg struct {
-		JobID string `json:"jobId"`
-	}
-	require.NoError(t, json.Unmarshal(out, &msg), "enqueuer.js stdout: %s", string(out))
-	require.NotEmpty(t, msg.JobID)
-	return msg.JobID
+	return runNodeEnqueuerOpts(t, prefix, queueName, payloadJSON, nodeEnqueuerOpts{})
 }
 
 type interopPayload struct {

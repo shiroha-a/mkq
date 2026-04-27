@@ -12,7 +12,6 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -139,5 +138,4 @@ func TestInterop_StalledRecovery(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 0, exists, "lock key should be released after stalled-recovery flow")
 
-	_ = strconv.Itoa // silence unused-import false positive across Go versions
 }
