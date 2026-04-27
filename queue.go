@@ -86,6 +86,9 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 	if cfg.dedupSet && cfg.dedupID == "" {
 		return nil, fmt.Errorf("mkq: WithDeduplication / WithUnique id must be non-empty")
 	}
+	if cfg.jobNameSet && cfg.jobName == "" {
+		return nil, fmt.Errorf("mkq: WithJobName name must be non-empty")
+	}
 
 	dataJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -94,10 +97,15 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 
 	timestampMs := time.Now().UnixMilli()
 
+	jobName := q.name
+	if cfg.jobName != "" {
+		jobName = cfg.jobName
+	}
+
 	args := proto.AddArgs{
 		Prefix:    q.keys.Base(),
 		CustomID:  cfg.jobID,
-		Name:      q.name,
+		Name:      jobName,
 		Timestamp: timestampMs,
 	}
 	// dedup key を AddArgs[9] にも渡しておかないと lua 側の
@@ -140,7 +148,7 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 
 	job := &Job[T]{
 		ID:        jobID,
-		Name:      q.name,
+		Name:      jobName,
 		Data:      payload,
 		Timestamp: time.UnixMilli(timestampMs),
 		queue:     q,

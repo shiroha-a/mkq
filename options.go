@@ -14,6 +14,8 @@ type queueConfig struct {
 
 type addConfig struct {
 	jobID            string
+	jobName          string
+	jobNameSet       bool // distinguishes "WithJobName never called" from "called with empty name"
 	delay            time.Duration
 	attempts         int
 	priority         uint32
@@ -33,6 +35,25 @@ type addConfig struct {
 // layer ("if a job with this id already exists, do nothing").
 func WithJobID(id string) AddOption {
 	return func(c *addConfig) { c.jobID = id }
+}
+
+// WithJobName overrides the per-job BullMQ `name` field, which mkq
+// otherwise sets to the queue name. The handler observes the value
+// via Job.Name and bull-board displays it as the job's label.
+//
+// The primary use case is adapter-side per-task-type fan-out: a
+// single mkq Queue can carry multiple logical task types whose
+// dispatch the handler decodes from Job.Name. mk-go's MkqDriver
+// uses this to map asynq-style `mux.HandleFunc(taskType, ...)`
+// registration onto mkq's per-queue Process.
+//
+// An empty name is rejected by Queue.Add (use the option to set a
+// real name, omit it to fall back to the queue-name default).
+func WithJobName(name string) AddOption {
+	return func(c *addConfig) {
+		c.jobName = name
+		c.jobNameSet = true
+	}
 }
 
 // WithDelay schedules the job to first become eligible after d. The
