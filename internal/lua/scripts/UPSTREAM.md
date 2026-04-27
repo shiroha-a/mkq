@@ -42,6 +42,7 @@ Entry points:
 - `drain-5.lua`
 - `promote-9.lua`
 - `reprocessJob-8.lua`
+- `getMetrics-2.lua`
 
 `includes/` — every script transitively reachable from the entry points
 above via `--- @include "..."` directives.

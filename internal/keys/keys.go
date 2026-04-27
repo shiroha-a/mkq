@@ -86,6 +86,16 @@ func (b Builder) Dedup(id string) string {
 	return b.Base() + "de:" + id
 }
 
+// Metrics returns the BullMQ-spec per-target metrics HASH key
+// (`{prefix}:{queue}:metrics:{target}`). Companion data LIST lives at
+// the same key with `:data` appended; collectMetrics in
+// moveToFinished-14.lua does the suffixing itself, so callers never
+// need a separate MetricsData helper. target is "completed" or
+// "failed" — callers are expected to derive it from a JobBucket.
+func (b Builder) Metrics(target string) string {
+	return b.Base() + "metrics:" + target
+}
+
 // Job returns the per-job HASH key.
 func (b Builder) Job(jobID string) string { return b.Base() + jobID }
 
