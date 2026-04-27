@@ -33,6 +33,8 @@ func TestBuilder_BullMQLayout(t *testing.T) {
 		{"job-uint", New("bull", "deliver").JobUint(42), "bull:deliver:42"},
 		{"job-logs", New("bull", "deliver").JobLogs("42"), "bull:deliver:42:logs"},
 		{"job-lock", New("bull", "deliver").JobLock("42"), "bull:deliver:42:lock"},
+		{"metrics-completed", New("bull", "deliver").Metrics("completed"), "bull:deliver:metrics:completed"},
+		{"metrics-failed", New("bull", "deliver").Metrics("failed"), "bull:deliver:metrics:failed"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {

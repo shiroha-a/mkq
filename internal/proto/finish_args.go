@@ -2,6 +2,7 @@ package proto
 
 import (
 	"errors"
+	"strconv"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -33,6 +34,14 @@ type MoveToFinishedOpts struct {
 	// opts['limiter']['max'] / ['duration'] for the rate-limit
 	// gating that protects throughput. Nil = no limiter.
 	Limiter *MoveToActiveLimiter
+	// MaxMetricsSize toggles the BullMQ per-minute metrics write
+	// path inside collectMetrics. <=0 emits "" (existing behaviour,
+	// metrics disabled); >0 emits the numeric string the Lua's
+	// outer guard reads, with N capping the kept data-point count
+	// per LTRIM. Field name mirrors the Lua opts key
+	// (`opts['maxMetricsSize']`); the public-facing option exposes
+	// `maxDataPoints` (BullMQ TS does the same translation).
+	MaxMetricsSize int
 }
 
 // KeepJobs mirrors BullMQ's keepJobs option. Either field can be set;
@@ -79,12 +88,20 @@ func EncodeMoveToFinishedOpts(o MoveToFinishedOpts) ([]byte, error) {
 				keep["age"] = o.KeepJobs.Age
 			}
 		}
+		// maxMetricsSize: BullMQ Lua reads it as a string and uses
+		// non-empty-ness as the gate, then tonumber()s the value.
+		// Emit numeric string when N>0, "" otherwise (matches BullMQ
+		// TS scripts.ts:749 — `opts.metrics?.maxDataPoints ? ... : ''`).
+		maxMetricsSize := ""
+		if o.MaxMetricsSize > 0 {
+			maxMetricsSize = strconv.Itoa(o.MaxMetricsSize)
+		}
 		m := map[string]any{
 			"token":          o.Token,
 			"lockDuration":   o.LockDuration,
 			"attempts":       o.Attempts,
 			"keepJobs":       keep,
-			"maxMetricsSize": "",
+			"maxMetricsSize": maxMetricsSize,
 		}
 		if o.Name != "" {
 			m["name"] = o.Name

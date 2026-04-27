@@ -48,6 +48,7 @@ const (
 	AddLog                ScriptName = "addLog-2"
 	GetCounts             ScriptName = "getCounts-1"
 	GetRanges             ScriptName = "getRanges-1"
+	GetMetrics            ScriptName = "getMetrics-2"
 	RemoveJob             ScriptName = "removeJob-2"
 	Drain                 ScriptName = "drain-5"
 	Promote               ScriptName = "promote-9"
@@ -99,7 +100,7 @@ func NewScripter(ctx context.Context, client redis.Scripter, logger Logger) (*Sc
 		RetryJob, MoveToDelayed, MoveStalledJobsToWait,
 		AddJobScheduler, UpdateJobScheduler,
 		UpdateProgress, UpdateData, AddLog,
-		GetCounts, GetRanges,
+		GetCounts, GetRanges, GetMetrics,
 		RemoveJob, Drain, Promote, ReprocessJob,
 	} {
 		if _, err := s.load(ctx, name); err != nil {

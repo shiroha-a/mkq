@@ -109,6 +109,32 @@ func TestEncodeMoveToFinishedOpts_AlwaysIncludesNilSafeFields(t *testing.T) {
 	}
 }
 
+func TestEncodeMoveToFinishedOpts_MaxMetricsSizeWhenSet(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := EncodeMoveToFinishedOpts(MoveToFinishedOpts{
+		Token:          "t",
+		LockDuration:   1000,
+		MaxMetricsSize: 60,
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var m map[string]any
+	if err := msgpack.Unmarshal(encoded, &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	v, ok := m["maxMetricsSize"]
+	if !ok {
+		t.Fatal("maxMetricsSize must be present")
+	}
+	// BullMQ Lua expects the numeric string form; the outer if-guard
+	// keys off non-empty-ness and collectMetrics tonumber()s it.
+	if v != "60" {
+		t.Errorf("maxMetricsSize: got %v (%T), want \"60\"", v, v)
+	}
+}
+
 func TestEncodeJobFields(t *testing.T) {
 	t.Parallel()
 

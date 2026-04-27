@@ -84,6 +84,7 @@ type queueKeys struct {
 	wait, active, prioritized, events, stalled string
 	limiter, delayed, paused, meta, pc, marker string
 	completed, failed                          string
+	metricsCompleted, metricsFailed            string
 	stalledCheck                               string
 	prefix                                     string
 	// repeat / id are needed for the worker-side re-schedule path
@@ -953,10 +954,11 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *rete
 	now := time.Now().UnixMilli()
 
 	optsArgs := proto.MoveToFinishedOpts{
-		Token:        token,
-		LockDuration: w.cfg.lockDuration.Milliseconds(),
-		Attempts:     attempts,
-		Name:         w.cfg.workerName,
+		Token:          token,
+		LockDuration:   w.cfg.lockDuration.Milliseconds(),
+		Attempts:       attempts,
+		Name:           w.cfg.workerName,
+		MaxMetricsSize: w.cfg.maxDataPoints,
 	}
 	// fetchNext=1 の lua 経路 (fetchNextJob) は opts['limiter'] を読んで
 	// rate limit gating する。worker config に limiter があればここで
@@ -1473,9 +1475,11 @@ func newQueueKeys[T any](q *Queue[T]) queueKeys {
 		meta:         b.Meta(),
 		pc:           b.PriorityCounter(),
 		marker:       b.Marker(),
-		completed:    b.Completed(),
-		failed:       b.Failed(),
-		stalledCheck: b.StalledCheck(),
+		completed:        b.Completed(),
+		failed:           b.Failed(),
+		metricsCompleted: b.Metrics("completed"),
+		metricsFailed:    b.Metrics("failed"),
+		stalledCheck:     b.StalledCheck(),
 		prefix:       b.Base(),
 		repeat:       b.Repeat(),
 		id:           b.ID(),
@@ -1501,18 +1505,22 @@ func (k queueKeys) moveToActiveKeys() []string {
 }
 
 // moveToFinishedKeys assembles KEYS[1..14] for moveToFinished-14.lua.
-// KEYS[11] toggles between completed and failed depending on target;
-// KEYS[13] (metrics key) is intentionally empty until observability
-// lands.
+// KEYS[11] / KEYS[13] toggle between completed and failed depending
+// on target. KEYS[13] is always populated with the BullMQ-spec
+// metrics key; the Lua's outer `if maxMetricsSize ~= ""` guards the
+// actual write so passing the real key when the feature is disabled
+// is harmless.
 func (k queueKeys) moveToFinishedKeys(jobID, target string) []string {
 	resultSet := k.completed
+	metricsKey := k.metricsCompleted
 	if target == "failed" {
 		resultSet = k.failed
+		metricsKey = k.metricsFailed
 	}
 	return []string{
 		k.wait, k.active, k.prioritized, k.events, k.stalled,
 		k.limiter, k.delayed, k.paused, k.meta, k.pc,
-		resultSet, k.job(jobID), "", k.marker,
+		resultSet, k.job(jobID), metricsKey, k.marker,
 	}
 }
 

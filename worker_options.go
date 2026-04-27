@@ -13,6 +13,7 @@ type workerConfig struct {
 	stalledInterval  time.Duration
 	maxStalledCount  int
 	limiter          *workerLimiter
+	maxDataPoints    int // 0 = disabled (BullMQ-spec metrics off)
 }
 
 type workerLimiter struct {
@@ -113,5 +114,30 @@ func WithRateLimit(max int, duration time.Duration) WorkerOption {
 			return
 		}
 		c.limiter = &workerLimiter{max: max, duration: duration}
+	}
+}
+
+// WithJobMetrics enables BullMQ-spec per-minute job-count metrics
+// (the `bull:<queue>:metrics:completed` / `:failed` HASH + `:data`
+// LIST). maxDataPoints caps the number of one-minute buckets kept
+// in the data LIST (LTRIM after each finalise); <=0 disables the
+// feature, matching BullMQ TS's `metrics: { maxDataPoints }` option
+// on `WorkerOptions`.
+//
+// Once enabled, every moveToFinished call by this worker writes a
+// bucket atomically alongside the state transition. Read the data
+// back via Queue.GetMetrics; bull-board / Misskey admin and other
+// BullMQ-aware dashboards see it directly because the keys and
+// layout are wire-compatible with BullMQ v5+.
+//
+// The option name `JobMetrics` disambiguates from the unrelated
+// `mkq.Metrics` observability interface (Logger / Metrics / Tracer)
+// configured on Config.
+func WithJobMetrics(maxDataPoints int) WorkerOption {
+	return func(c *workerConfig) {
+		if maxDataPoints < 0 {
+			maxDataPoints = 0
+		}
+		c.maxDataPoints = maxDataPoints
 	}
 }
