@@ -16,9 +16,20 @@ import (
 // per call is the returned []byte (which msgpack would have allocated
 // anyway as the encoder's output).
 //
-// The pool's pairs reset on Get so callers don't need to clear state
-// before encoding. Returned buffers shrink to a sane cap on Put to
-// avoid pinning oversize buffers from outlier-large encodes.
+// Reset discipline: encodeMsgpack performs Buffer.Reset + Encoder.Reset
+// **before** Put, so every Get returns an already-clean pair. Outlier-
+// large encodes (Cap > shrinkCap) are dropped from the pool instead
+// of returned, so a one-off huge JobFields encode doesn't pin a
+// multi-MB buffer in the pool indefinitely.
+//
+// Pooling scope is intentionally narrow: only the per-job dispatch
+// encoders. Add-path encoders (EncodeAddArgs, EncodeAddOpts) and
+// scheduler-path encoders (EncodeScheduleOpts and friends) still
+// call msgpack.Marshal directly — those run at upsert / Add time,
+// not the dispatch loop, so the per-call allocation cost is
+// amortised over a much higher per-event budget. If add throughput
+// ever becomes a measured bottleneck, the same encodeMsgpack
+// helper extends trivially.
 var encoderPool = sync.Pool{
 	New: func() any {
 		buf := &bytes.Buffer{}
@@ -43,8 +54,9 @@ type pooledEncoder struct {
 // owns the returned slice independently.
 //
 // Callers MUST NOT retain references to the pooled encoder beyond
-// fn's return. msgpack.Encoder.Reset is called on every Get so any
-// stale state from a previous encode is overwritten.
+// fn's return. The defer below performs Buffer.Reset +
+// msgpack.Encoder.Reset before Put, guaranteeing every subsequent
+// Get sees a clean writer with no carryover from earlier encodes.
 //
 // shrinkCap caps the buffer's underlying capacity on Put so a one-off
 // huge encode (e.g. a large JobFields list with many extra HASH
