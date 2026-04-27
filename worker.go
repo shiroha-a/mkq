@@ -261,10 +261,16 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 		}
 		processed, gotPrefetched, expireTimeMs, nextDelayedTs, err := w.tryOnce(handlerAny)
 		if err != nil {
-			// 取得や lua 失敗はログ的扱い (worker は止めない)。
-			// 本格的なエラー報告チャネルは observability PR で導入。
+			// 取得や lua 失敗は Warn でログ (worker は止めない)。
+			// stalledLoop と同じ best-effort パターン: 単発失敗は次 tick
+			// で recover できるが、連続失敗時に黙ってジョブが滞留する
+			// ことを避けるため Logger 経由で ops に出す。
 			// エラー時は marker を待たずに idle interval だけ眠る:
 			// 連続失敗時に hot-loop しないため。
+			w.logger.Warn("mkq: dispatch attempt failed",
+				slog.String(AttrQueue, w.queueName),
+				slog.String(AttrError, err.Error()),
+			)
 			if !w.sleep(w.cfg.idlePollInterval) {
 				return
 			}
@@ -533,8 +539,12 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 	defer cancelJob()
 
 	jobName := jobMap["name"]
-	// dispatch_wait は wait-list 投入から handler 起動直前までの遅延。
-	// jobMap["timestamp"] は ms epoch (Queue.Add で書かれた値)。
+	// dispatch_wait は Queue.Add 時の timestamp から handler 起動直前
+	// までの end-to-end 遅延。delayed job では意図された delay 期間も
+	// 含まれる (= 「ジョブが完了するまでにかかった全体時間」のうち
+	// handler 実行を除いた部分)。標準ジョブでは wait-list 滞留時間に
+	// 一致する。delayed の意図的な遅延を除いた純粋な滞留だけを見たい
+	// 場合は、ユーザ側 ops で delay を控除する想定。
 	if tsMs, perr := strconv.ParseInt(jobMap["timestamp"], 10, 64); perr == nil && tsMs > 0 {
 		waitSec := float64(time.Now().UnixMilli()-tsMs) / 1000.0
 		if waitSec >= 0 {
@@ -578,6 +588,14 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 			[]string{w.keys.jobLock(jobID)},
 			token,
 			w.cfg.lockDuration.Milliseconds(),
+		)
+		// Logger と span の両方に流す。Tracer 未設定で Logger だけの
+		// ユーザでも infra エラーが拾えるようにする (stalledLoop と
+		// 同じパターン)。
+		w.logger.Warn("mkq: finalise failed",
+			slog.String(AttrQueue, w.queueName),
+			slog.String(AttrJobID, jobID),
+			slog.String(AttrError, err.Error()),
 		)
 		// span.SetError は actionable な infra エラーで上書きするが、
 		// handler が先に失敗して finishFailed が二次的に失敗した場合は

@@ -3,6 +3,7 @@ package mkq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -77,7 +78,11 @@ func (q *Queue[T]) Name() string { return q.name }
 func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (job *Job[T], err error) {
 	ctx, span := q.client.tracer.Start(ctx, SpanQueueAdd, slog.String(AttrQueue, q.name))
 	defer func() {
-		if err != nil {
+		// dedup hit は trace 上の "error" として扱わない (dashboard の
+		// error rate を汚さないため)。SetError 経由ではなく
+		// `mkq.dedup.hit=true` attr で記録に切り替える。dedup branch 側
+		// で attr セット済み。
+		if err != nil && !errors.Is(err, ErrDuplicateJob) {
 			span.SetError(err)
 		}
 		span.End()
@@ -169,7 +174,9 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (job *
 		// 通知。Job.Data は呼び出し側 payload なので、本当に既存 job
 		// の payload が欲しい場合は Queue.Get(jobID) で再取得する。
 		// dedup hit は新規 add ではないので jobs_added_total はインクリ
-		// しない。span は SetError 経由で「dedup により reject」を残す。
+		// しない。span 上は error 扱いせず attribute で識別だけ残す
+		// (defer の SetError ガードと連動)。
+		span.SetAttrs(slog.Bool("mkq.dedup.hit", true))
 		err = ErrDuplicateJob
 		return job, err
 	}
