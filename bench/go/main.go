@@ -205,6 +205,15 @@ func runLatency(ctx context.Context, queue *mkq.Queue[payload], n int, concurren
 // addRuntime augments a result map with Go-runtime self-observed memory
 // stats. These are application-internal numbers (heap-only); for OS-
 // level RSS / CPU pair them with run.sh's /usr/bin/time wrapper.
+//
+// `allocPerJob` divides the cumulative TotalAlloc counter by the job
+// count. For the produce mode this is a clean per-job figure since
+// produce is essentially the only work the process does. For consume
+// and latency modes the numerator includes setup + (for latency) the
+// preceding enqueue phase, so the per-job number is an upper bound
+// rather than a tight measurement of the dispatch path's cost. Use
+// produce-mode allocPerJob when the question is "how heavy is one
+// Add"; for dispatch-cost work, instrument inside the handler.
 func addRuntime(m map[string]any) map[string]any {
 	var ms runtime.MemStats
 	runtime.GC() // make HeapAlloc measure live objects, not pre-GC peak

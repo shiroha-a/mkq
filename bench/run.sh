@@ -40,7 +40,7 @@ export GOTOOLCHAIN="${GOTOOLCHAIN:-go1.25.0}"
 
 GO_BIN="$(mktemp -d)/mkqbench"
 STDERR_LOG=/tmp/mkqbench-stderr.log
-: > "$STDERR_LOG" # truncate per-run so累積しない
+: > "$STDERR_LOG" # truncate per-run so the log doesn't accumulate across invocations
 trap 'rm -rf "$(dirname "$GO_BIN")"' EXIT
 echo "==> compiling mkq bench" >&2
 go build -o "$GO_BIN" ./bench/go
@@ -106,8 +106,8 @@ clear_prefixes() {
     | xargs -r redis-cli -h "${REDIS%:*}" -p "${REDIS##*:}" del >/dev/null
 }
 
-for prefix in mkqbench bullbench; do
-  clear_prefixes "$prefix" || true
+for pref in mkqbench bullbench; do
+  clear_prefixes "$pref" || true
 done
 
 echo "## produce"
@@ -122,8 +122,8 @@ echo
 
 # Latency mode wipes the prefixes again so the per-job timestamps don't
 # race against any leftover state.
-for prefix in mkqbench bullbench; do
-  clear_prefixes "$prefix" || true
+for pref in mkqbench bullbench; do
+  clear_prefixes "$pref" || true
 done
 
 echo "## latency (Add → Process e2e)"
@@ -131,8 +131,8 @@ run_one latency mkq        "$GO_BIN" -mode=latency -jobs="$JOBS" -concurrency="$
 run_one latency bullmq-ts  "$NODE_BIN" bench/node/latency.mjs --jobs="$JOBS" --concurrency="$CONCURRENCY" --prefix=bullbench --redis="$REDIS"
 echo
 
-for prefix in mkqbench bullbench; do
-  clear_prefixes "$prefix" || true
+for pref in mkqbench bullbench; do
+  clear_prefixes "$pref" || true
 done
 
 echo "==> done"
