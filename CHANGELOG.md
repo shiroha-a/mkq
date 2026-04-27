@@ -6,6 +6,32 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-04-27
+
+### Added
+
+- BullMQ-compatible per-queue metrics (#59, #60). Enables the
+  previously-disabled write path inside the vendored
+  `moveToFinished-14.lua` so per-minute completed/failed buckets
+  land in the BullMQ-spec keys (`bull:<q>:metrics:<target>` HASH +
+  `...:data` LIST). bull-board / Misskey admin / mk-go admin
+  charts that LRANGE the BullMQ key now see real data. Adopts
+  BullMQ TS's API shape exactly:
+  - `WithJobMetrics(maxDataPoints int) WorkerOption` — opt-in
+    write path; mirrors BullMQ TS `WorkerOptions.metrics:
+    { maxDataPoints }`.
+  - `Queue[T].GetMetrics(ctx, kind, start, end) (QueueMetrics, error)`
+    — atomic read via vendored `getMetrics-2.lua`.
+  - `QueueMetrics{Meta: QueueMetricsMeta{Count, PrevTS, PrevCount},
+    Data, Count}` matches BullMQ TS `Metrics` interface.
+  - `ErrInvalidMetricsBucket` for non-completed/failed kinds.
+
+### Notes
+
+- This release is a strict additive minor under semver (no
+  breaking changes); kept on the patch line per the project's
+  early-stage `1.0.x` cadence.
+
 ## [1.0.0] - 2026-04-27
 
 Initial stable release. Wire format and public API are stable from
@@ -117,5 +143,6 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.1
 [1.0.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.0
