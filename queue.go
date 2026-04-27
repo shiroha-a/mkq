@@ -83,6 +83,9 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 	if delayMs > 0 && cfg.priority > 0 {
 		return nil, ErrPriorityWithDelay
 	}
+	if cfg.dedupSet && cfg.dedupID == "" {
+		return nil, fmt.Errorf("mkq: WithDeduplication / WithUnique id must be non-empty")
+	}
 
 	dataJSON, err := json.Marshal(payload)
 	if err != nil {
@@ -97,6 +100,14 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 		Name:      q.name,
 		Timestamp: timestampMs,
 	}
+	// dedup key を AddArgs[9] にも渡しておかないと lua 側の
+	// deduplicateJob が SET 対象のキーを知らない。空文字なら
+	// EncodeAddArgs が nil として詰めるので非 dedup 用途には影響なし。
+	var dedupKey string
+	if cfg.dedupID != "" {
+		dedupKey = q.keys.Dedup(cfg.dedupID)
+		args.DeduplicationKey = dedupKey
+	}
 	argsBytes, err := proto.EncodeAddArgs(args)
 	if err != nil {
 		return nil, fmt.Errorf("mkq: encode args: %w", err)
@@ -105,6 +116,15 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 	optsBytes, err := proto.EncodeAddOpts(toProtoOpts(cfg, delayMs))
 	if err != nil {
 		return nil, fmt.Errorf("mkq: encode opts: %w", err)
+	}
+
+	// dedup hit を Go 側で検出するため、EVAL 直前の dedup key の値を
+	// 取っておく。lua は hit / miss どちらでも返り値が string jobID
+	// なので、pre-GET の結果と返り値を比較して hit を識別する。
+	// pre-GET と EVAL の間の race は下流ドキュメント通り best-effort。
+	var preDedupID string
+	if dedupKey != "" {
+		preDedupID, _ = q.client.rdb.Get(ctx, dedupKey).Result()
 	}
 
 	scriptName, ks := q.dispatch(delayMs, cfg.priority)
@@ -118,13 +138,20 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 		return nil, err
 	}
 
-	return &Job[T]{
+	job := &Job[T]{
 		ID:        jobID,
 		Name:      q.name,
 		Data:      payload,
 		Timestamp: time.UnixMilli(timestampMs),
 		queue:     q,
-	}, nil
+	}
+	if preDedupID != "" && preDedupID == jobID {
+		// dedup hit — 既存 job をそのまま返しつつ ErrDuplicateJob で
+		// 通知。Job.Data は呼び出し側 payload なので、本当に既存 job
+		// の payload が欲しい場合は Queue.Get(jobID) で再取得する。
+		return job, ErrDuplicateJob
+	}
+	return job, nil
 }
 
 // dispatch picks the BullMQ Lua entry point and assembles its KEYS list
@@ -197,6 +224,12 @@ func toProtoOpts(cfg addConfig, delayMs int64) proto.AddOpts {
 		o.Backoff = &proto.Backoff{
 			Type:  cfg.backoff.Type,
 			Delay: cfg.backoff.Delay.Milliseconds(),
+		}
+	}
+	if cfg.dedupID != "" {
+		o.Deduplication = &proto.Deduplication{
+			ID:        cfg.dedupID,
+			TTLMillis: cfg.dedupTTL.Milliseconds(),
 		}
 	}
 	return o

@@ -78,6 +78,14 @@ func (b Builder) Schedule(scheduleID string) string {
 	return b.Base() + "repeat:" + scheduleID
 }
 
+// Dedup returns the per-id deduplication key BullMQ writes when an
+// Add carries `opts.de` (deduplication options). The composition
+// `{prefix}:{queue}:de:<id>` mirrors BullMQ TS's
+// `${queueKeys.de}:${job.deduplicationId}` from scripts.ts addJob.
+func (b Builder) Dedup(id string) string {
+	return b.Base() + "de:" + id
+}
+
 // Job returns the per-job HASH key.
 func (b Builder) Job(jobID string) string { return b.Base() + jobID }
 

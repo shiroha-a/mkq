@@ -61,3 +61,17 @@ var ErrJobNotInDelayed = errors.New("mkq: job is not in the delayed state")
 // WithRetryFromState (default: "failed"). BullMQ's reprocessJob-8.lua
 // returns -3 in this case.
 var ErrJobNotInExpectedState = errors.New("mkq: job is not in the expected source state for retry")
+
+// ErrDuplicateJob is returned by Queue.Add (alongside the existing
+// Job[T] handle) when WithDeduplication / WithUnique suppresses the
+// new enqueue because a prior job with the same dedup id is still
+// within its TTL window. Callers can errors.Is-check this sentinel
+// to distinguish "I just enqueued" from "the prior job is still
+// pending"; the returned Job[T] points at the surviving (existing)
+// job so a follow-up Queue.Get works either way.
+//
+// Detection is best-effort: a narrow race between the pre-EVAL
+// dedup-key GET and the EVAL itself can let a true duplicate slip
+// through as a non-error response. The returned job ID is always
+// usable regardless.
+var ErrDuplicateJob = errors.New("mkq: job suppressed by deduplication; existing job returned")

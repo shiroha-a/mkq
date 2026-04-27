@@ -35,6 +35,23 @@ type AddOpts struct {
 	// object — caller responsibility to use (nil) for that case.
 	RemoveOnComplete *RetentionLimit
 	RemoveOnFail     *RetentionLimit
+	// Deduplication enables BullMQ's `opts.de` deduplication path.
+	// nil means "not set" (no dedup); set ID to a non-empty string
+	// to opt in.
+	Deduplication *Deduplication
+}
+
+// Deduplication mirrors the relevant subset of BullMQ's
+// `DeduplicationOpts` shape. mkq's first cut exposes only the
+// always-supported fields (id, ttl); replace / extend / keepLastIfActive
+// can land in follow-ups if mk-go ever needs them.
+type Deduplication struct {
+	// ID is the dedup correlation key. Required.
+	ID string
+	// TTLMillis is the dedup window in milliseconds. 0 = no TTL
+	// (the key sticks until manually removed or job finalisation
+	// clears it via the BullMQ on-finalization include).
+	TTLMillis int64
 }
 
 // RetentionLimit is BullMQ's `removeOnComplete` / `removeOnFail`
@@ -88,6 +105,13 @@ func EncodeAddOpts(o AddOpts) ([]byte, error) {
 	}
 	if v := encodeRetentionLimit(o.RemoveOnFail); v != nil {
 		m["removeOnFail"] = v
+	}
+	if d := o.Deduplication; d != nil && d.ID != "" {
+		de := map[string]any{"id": d.ID}
+		if d.TTLMillis > 0 {
+			de["ttl"] = d.TTLMillis
+		}
+		m["de"] = de
 	}
 	return msgpack.Marshal(m)
 }

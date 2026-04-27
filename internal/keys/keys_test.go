@@ -28,6 +28,7 @@ func TestBuilder_BullMQLayout(t *testing.T) {
 		{"limiter", New("bull", "deliver").Limiter(), "bull:deliver:limiter"},
 		{"repeat", New("bull", "deliver").Repeat(), "bull:deliver:repeat"},
 		{"schedule", New("bull", "deliver").Schedule("daily"), "bull:deliver:repeat:daily"},
+		{"dedup", New("bull", "deliver").Dedup("user:42"), "bull:deliver:de:user:42"},
 		{"job", New("bull", "deliver").Job("42"), "bull:deliver:42"},
 		{"job-uint", New("bull", "deliver").JobUint(42), "bull:deliver:42"},
 		{"job-logs", New("bull", "deliver").JobLogs("42"), "bull:deliver:42:logs"},
