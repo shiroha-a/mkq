@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -73,7 +74,15 @@ func (q *Queue[T]) Name() string { return q.name }
 //   - otherwise                  → addStandardJob-9
 //
 // Combining WithPriority and WithDelay returns ErrPriorityWithDelay.
-func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[T], error) {
+func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (job *Job[T], err error) {
+	ctx, span := q.client.tracer.Start(ctx, SpanQueueAdd, slog.String(AttrQueue, q.name))
+	defer func() {
+		if err != nil {
+			span.SetError(err)
+		}
+		span.End()
+	}()
+
 	cfg := addConfig{}
 	for _, o := range opts {
 		o(&cfg)
@@ -101,6 +110,7 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 	if cfg.jobName != "" {
 		jobName = cfg.jobName
 	}
+	span.SetAttrs(slog.String(AttrJobName, jobName))
 
 	args := proto.AddArgs{
 		Prefix:    q.keys.Base(),
@@ -145,8 +155,9 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 	if err != nil {
 		return nil, err
 	}
+	span.SetAttrs(slog.String(AttrJobID, jobID))
 
-	job := &Job[T]{
+	job = &Job[T]{
 		ID:        jobID,
 		Name:      jobName,
 		Data:      payload,
@@ -157,8 +168,15 @@ func (q *Queue[T]) Add(ctx context.Context, payload T, opts ...AddOption) (*Job[
 		// dedup hit — 既存 job をそのまま返しつつ ErrDuplicateJob で
 		// 通知。Job.Data は呼び出し側 payload なので、本当に既存 job
 		// の payload が欲しい場合は Queue.Get(jobID) で再取得する。
-		return job, ErrDuplicateJob
+		// dedup hit は新規 add ではないので jobs_added_total はインクリ
+		// しない。span は SetError 経由で「dedup により reject」を残す。
+		err = ErrDuplicateJob
+		return job, err
 	}
+	q.client.metrics.CounterAdd(MetricJobsAddedTotal, 1,
+		slog.String(AttrQueue, q.name),
+		slog.String(AttrJobName, jobName),
+	)
 	return job, nil
 }
 

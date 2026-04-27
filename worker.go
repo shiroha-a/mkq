@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -45,10 +47,14 @@ type Handler[T any] func(ctx context.Context, job *Job[T]) (any, error)
 // Worker is the lifecycle handle returned by Process. It owns its
 // goroutine pool and the per-job lock heartbeats.
 type Worker struct {
-	cfg     workerConfig
-	keys    queueKeys
-	scripts *lua.Scripter
-	rdb     redis.UniversalClient
+	cfg       workerConfig
+	keys      queueKeys
+	queueName string
+	scripts   *lua.Scripter
+	rdb       redis.UniversalClient
+	logger    Logger
+	metrics   Metrics
+	tracer    Tracer
 
 	// runCtx is cancelled by Stop to break dispatch goroutines out of
 	// the dequeue loop. Each in-flight handler derives its job ctx
@@ -119,11 +125,41 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 	w := &Worker{
 		cfg:       cfg,
 		keys:      newQueueKeys(q),
+		queueName: q.name,
 		scripts:   q.client.scripts,
 		rdb:       q.client.rdb,
+		logger:    q.client.logger,
+		metrics:   q.client.metrics,
+		tracer:    q.client.tracer,
 		runCtx:    ctx,
 		runCancel: cancel,
 		stopDone:  make(chan struct{}),
+	}
+
+	// BZPopMin の awaitMarker は worker slot ごとに 1 connection を専有
+	// するため、concurrency >= pool size だと dispatch が他の Redis 呼び
+	// 出し (extendLock など) を待ってデッドロック気味になる。
+	// configuredPoolSize=0 は go-redis の既定値 (10*GOMAXPROCS) を意味
+	// するので、ここで実効値に展開してから比較する。これにより既定値
+	// ユーザでも concurrency が大きい場合に警告が出る。
+	//
+	// 限界: この警告は Process() 1 呼び出し単体での見積もり。同一 Client
+	// に複数 Worker がぶら下がる場合は累積 concurrency を見ないので
+	// 警告が漏れる。Cluster mode の go-redis 既定は 5*GOMAXPROCS per
+	// node なので 10*GOMAXPROCS の見積もりは過大 (= 警告が出にくい)
+	// 方向に外れる。Ops 側で複数ワーカ運用 / cluster mode の場合は
+	// PoolSize を明示指定して本警告のシグナルを正しく扱う前提。
+	effectivePoolSize := q.client.configuredPoolSize
+	if effectivePoolSize == 0 {
+		effectivePoolSize = 10 * runtime.GOMAXPROCS(0)
+	}
+	if cfg.concurrency+8 > effectivePoolSize {
+		w.logger.Warn("mkq: redis pool size below recommended (concurrency + 8)",
+			slog.String(AttrQueue, q.name),
+			slog.Int("concurrency", cfg.concurrency),
+			slog.Int("pool_size", effectivePoolSize),
+			slog.Int("recommended_minimum", cfg.concurrency+8),
+		)
 	}
 
 	shim := newHandlerShim(q, h)
@@ -345,8 +381,12 @@ func (w *Worker) stalledLoop() {
 		case <-t.C:
 			if err := w.runStalledCheck(); err != nil {
 				// Best-effort: a single tick's failure is recoverable
-				// (next tick will try again). Surface via observability
-				// when that lands.
+				// (next tick will try again). Surface to ops via Logger
+				// so persistent failures don't stay invisible.
+				w.logger.Warn("mkq: stalled-jobs scan failed",
+					slog.String(AttrQueue, w.queueName),
+					slog.String(AttrError, err.Error()),
+				)
 				continue
 			}
 		}
@@ -446,6 +486,9 @@ func (w *Worker) tryOnce(handlerAny any) (bool, *prefetchedJob, int64, int64, er
 // field so a re-acquired but recovered job won't short-circuit on
 // stale state.
 func (w *Worker) runJob(handlerAny any, token, jobID string, jobMap map[string]string) *prefetchedJob {
+	w.metrics.GaugeAdd(MetricJobsInFlight, 1, slog.String(AttrQueue, w.queueName))
+	defer w.metrics.GaugeAdd(MetricJobsInFlight, -1, slog.String(AttrQueue, w.queueName))
+
 	if defa, hasDefa := jobMap["defa"]; hasDefa && defa != "" {
 		jobOpts := parseJobOpts(jobMap["opts"])
 		prefetched, err := w.finishFailed(jobID, token, jobOpts, defa, mustJSONString([]string{defa}))
@@ -457,6 +500,14 @@ func (w *Worker) runJob(handlerAny any, token, jobID string, jobMap map[string]s
 				[]string{w.keys.jobLock(jobID)},
 				token,
 				w.cfg.lockDuration.Milliseconds(),
+			)
+		} else {
+			// defa fast-path は handler を呼ばずに failed に直行するので
+			// processed_total は記録するが handler_duration は記録しない。
+			w.metrics.CounterAdd(MetricJobsProcessedTotal, 1,
+				slog.String(AttrQueue, w.queueName),
+				slog.String(AttrJobName, jobMap["name"]),
+				slog.String(AttrProcessStatus, "failed"),
 			)
 		}
 		return prefetched
@@ -481,17 +532,43 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 	jobCtx, cancelJob := context.WithCancel(w.runCtx)
 	defer cancelJob()
 
+	jobName := jobMap["name"]
+	// dispatch_wait は wait-list 投入から handler 起動直前までの遅延。
+	// jobMap["timestamp"] は ms epoch (Queue.Add で書かれた値)。
+	if tsMs, perr := strconv.ParseInt(jobMap["timestamp"], 10, 64); perr == nil && tsMs > 0 {
+		waitSec := float64(time.Now().UnixMilli()-tsMs) / 1000.0
+		if waitSec >= 0 {
+			w.metrics.HistogramObserve(MetricDispatchWaitSeconds, waitSec,
+				slog.String(AttrQueue, w.queueName),
+			)
+		}
+	}
+
+	jobCtx, span := w.tracer.Start(jobCtx, SpanWorkerProcess,
+		slog.String(AttrQueue, w.queueName),
+		slog.String(AttrJobID, jobID),
+		slog.String(AttrJobName, jobName),
+		slog.String(AttrJobAttempts, jobMap["atm"]),
+	)
+	defer span.End()
+
 	hbDone := make(chan struct{})
 	go w.heartbeat(jobCtx, hbDone, token, jobID, cancelJob)
 
+	handlerStart := time.Now()
 	outcome := w.runHandler(jobCtx, handlerAny, jobID, jobMap)
+	w.metrics.HistogramObserve(MetricHandlerDurationSeconds,
+		time.Since(handlerStart).Seconds(),
+		slog.String(AttrQueue, w.queueName),
+		slog.String(AttrJobName, jobName),
+	)
 
 	// Heartbeat must finish before any finalisation Lua call so its
 	// extendLock won't race with the script's lock-token validation.
 	cancelJob()
 	<-hbDone
 
-	prefetched, err := w.finalise(jobID, token, jobMap, outcome)
+	prefetched, status, err := w.finalise(jobID, token, jobMap, outcome)
 	if err != nil {
 		// Best-effort lock cleanup so a failed terminal call doesn't
 		// strand the lock for the full TTL.
@@ -502,6 +579,30 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 			token,
 			w.cfg.lockDuration.Milliseconds(),
 		)
+		// span.SetError は actionable な infra エラーで上書きするが、
+		// handler が先に失敗して finishFailed が二次的に失敗した場合は
+		// 元の handler error が trace から消える。debug 用に attribute
+		// として残しておく (errReason は既に Lua へ渡されているので
+		// 個別フィールド化しても情報重複にならない)。
+		if !outcome.success && outcome.errReason != "" {
+			span.SetAttrs(slog.String("mkq.handler.error", outcome.errReason))
+		}
+		span.SetError(err)
+	}
+	switch status {
+	case finaliseStatusCompleted:
+		w.metrics.CounterAdd(MetricJobsProcessedTotal, 1,
+			slog.String(AttrQueue, w.queueName),
+			slog.String(AttrJobName, jobName),
+			slog.String(AttrProcessStatus, "completed"),
+		)
+	case finaliseStatusFailed:
+		w.metrics.CounterAdd(MetricJobsProcessedTotal, 1,
+			slog.String(AttrQueue, w.queueName),
+			slog.String(AttrJobName, jobName),
+			slog.String(AttrProcessStatus, "failed"),
+		)
+		span.SetError(outcome.err)
 	}
 
 	// 周期スケジュール (rjk) が紐付いている job は、仕上げ後に
@@ -667,8 +768,15 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 		cc, err := parseCron(pattern, tz)
 		if err != nil {
 			// HASH に書かれている pattern が parse できない = データ
-			// 破損 or 別 client が書き換えた。ログ手段がまだ無いので
-			// no-op (次 iteration が出ないだけ)。
+			// 破損 or 別 client が書き換えた。non-fatal だが次 iteration
+			// が永久に出ないので ops 通知が必要 → Error level。
+			w.logger.Error("mkq: cron pattern parse failure in rescheduleNext",
+				slog.String(AttrQueue, w.queueName),
+				slog.String("schedule_id", scheduleID),
+				slog.String("pattern", pattern),
+				slog.String("tz", tz),
+				slog.String(AttrError, err.Error()),
+			)
 			return
 		}
 		nextMillisVal = cc.nextFire(nowTime).UnixMilli()
@@ -732,16 +840,33 @@ func asString(v any) string {
 // the BullMQ HASH `atm` (attempts made) counter atomically inside
 // the script.
 //
+// finaliseStatus distinguishes the four post-finalise states the
+// caller cares about for observability. completed/failed are terminal;
+// retrying means the job got handed back to delayed/wait for another
+// attempt; finaliseError means the script call itself failed.
+type finaliseStatus int
+
+const (
+	finaliseStatusCompleted finaliseStatus = iota
+	finaliseStatusFailed
+	finaliseStatusRetrying
+	finaliseStatusError
+)
+
 // Returns the prefetched job from moveToFinished's fetchNext branch
 // when the path goes through finishCompleted / finishFailed. Retry
 // paths (retryJob / moveToDelayed) never produce a prefetched job
 // because their Lua scripts don't support fetchNext — those return
 // (nil, err).
-func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out handlerOutcome) (*prefetchedJob, error) {
+func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out handlerOutcome) (*prefetchedJob, finaliseStatus, error) {
 	jobOpts := parseJobOpts(jobMap["opts"])
 
 	if out.success {
-		return w.finishCompleted(jobID, token, jobOpts, out.returnValue)
+		pf, err := w.finishCompleted(jobID, token, jobOpts, out.returnValue)
+		if err != nil {
+			return pf, finaliseStatusError, err
+		}
+		return pf, finaliseStatusCompleted, nil
 	}
 
 	// Re-read atm from Redis instead of trusting the moveToActive
@@ -752,14 +877,24 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 	atm := w.fetchAtm(jobID, jobMap)
 
 	if !w.shouldRetry(jobOpts, atm, out.err) {
-		return w.finishFailed(jobID, token, jobOpts, out.errReason, out.stacktrace)
+		pf, err := w.finishFailed(jobID, token, jobOpts, out.errReason, out.stacktrace)
+		if err != nil {
+			return pf, finaliseStatusError, err
+		}
+		return pf, finaliseStatusFailed, nil
 	}
 
 	delay := computeBackoffDelay(jobOpts.backoff, atm+1)
 	if delay > 0 {
-		return nil, w.retryDelayed(jobID, token, delay, out.errReason, out.stacktrace)
+		if err := w.retryDelayed(jobID, token, delay, out.errReason, out.stacktrace); err != nil {
+			return nil, finaliseStatusError, err
+		}
+		return nil, finaliseStatusRetrying, nil
 	}
-	return nil, w.retryImmediate(jobID, token, jobOpts.lifo, out.errReason, out.stacktrace)
+	if err := w.retryImmediate(jobID, token, jobOpts.lifo, out.errReason, out.stacktrace); err != nil {
+		return nil, finaliseStatusError, err
+	}
+	return nil, finaliseStatusRetrying, nil
 }
 
 // finishCompleted writes the BullMQ completed-state transition.
@@ -906,6 +1041,14 @@ func (w *Worker) releasePrefetchedLock(pj *prefetchedJob) {
 	if pj == nil {
 		return
 	}
+	// shutdown race の発生 (fetchNext で job を locked したまま停止) は
+	// 通常 0 件のはずなので、一件でも観測されたら ops に伝えたい。
+	// debug-level: 単発であれば運用上問題ないが、頻発するなら shutdown
+	// 同期に問題があることを示すシグナル。
+	w.logger.Debug("mkq: releasing prefetched lock at shutdown",
+		slog.String(AttrQueue, w.queueName),
+		slog.String(AttrJobID, pj.jobID),
+	)
 	_, _ = w.scripts.Run(
 		context.Background(),
 		lua.ReleaseLock,

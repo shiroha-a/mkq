@@ -18,6 +18,18 @@ type Config struct {
 	// KeyPrefix maps to BullMQ's "keyPrefix" option. Empty defaults to
 	// "bull" to match BullMQ's own default.
 	KeyPrefix string
+
+	// Logger receives operational records (stalled-scan failures,
+	// NOSCRIPT reload events, etc.). Nil = noop. Adapters live under
+	// github.com/shiroha-a/mkq/observability/... — opt-in.
+	Logger Logger
+	// Metrics receives counter / histogram / gauge updates from the
+	// hot paths. Nil = noop. See the Metrics interface godoc for the
+	// signal set mkq emits.
+	Metrics Metrics
+	// Tracer creates spans around Queue.Add and handler invocation.
+	// Nil = noop. See the Tracer interface godoc for span names.
+	Tracer Tracer
 }
 
 // Client is a long-lived handle to a Redis-backed mkq deployment. A
@@ -27,6 +39,13 @@ type Client struct {
 	rdb       redis.UniversalClient
 	keyPrefix string
 	scripts   *lua.Scripter
+	logger    Logger
+	metrics   Metrics
+	tracer    Tracer
+	// configuredPoolSize は cfg.Redis.PoolSize の保存。0 は go-redis の
+	// 既定値 (10*GOMAXPROCS) を意味する。Worker 起動時の pool-size
+	// 警告に使う。
+	configuredPoolSize int
 }
 
 // NewClient connects to Redis, preloads the vendored BullMQ Lua scripts,
@@ -46,7 +65,20 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("mkq: redis ping: %w", err)
 	}
 
-	scripts, err := lua.NewScripter(ctx, rdb)
+	logger := cfg.Logger
+	if logger == nil {
+		logger = noopLogger{}
+	}
+	metrics := cfg.Metrics
+	if metrics == nil {
+		metrics = noopMetrics{}
+	}
+	tracer := cfg.Tracer
+	if tracer == nil {
+		tracer = noopTracer{}
+	}
+
+	scripts, err := lua.NewScripter(ctx, rdb, logger)
 	if err != nil {
 		_ = rdb.Close()
 		return nil, fmt.Errorf("mkq: load scripts: %w", err)
@@ -58,9 +90,13 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		rdb:       rdb,
-		keyPrefix: prefix,
-		scripts:   scripts,
+		rdb:                rdb,
+		keyPrefix:          prefix,
+		configuredPoolSize: cfg.Redis.PoolSize,
+		scripts:            scripts,
+		logger:             logger,
+		metrics:            metrics,
+		tracer:             tracer,
 	}, nil
 }
 
