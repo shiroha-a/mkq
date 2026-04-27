@@ -28,6 +28,11 @@ type MoveToFinishedOpts struct {
 	// Nil means BullMQ's default retention (keep all).
 	KeepJobs *KeepJobs
 	Name     string
+	// Limiter mirrors the moveToActive limiter shape; required when
+	// fetchNext=1 so the Lua's fetchNextJob branch can read
+	// opts['limiter']['max'] / ['duration'] for the rate-limit
+	// gating that protects throughput. Nil = no limiter.
+	Limiter *MoveToActiveLimiter
 }
 
 // KeepJobs mirrors BullMQ's keepJobs option. Either field can be set;
@@ -79,6 +84,12 @@ func EncodeMoveToFinishedOpts(o MoveToFinishedOpts) ([]byte, error) {
 	}
 	if o.Name != "" {
 		m["name"] = o.Name
+	}
+	if l := o.Limiter; l != nil && l.Max > 0 && l.DurationMs > 0 {
+		m["limiter"] = map[string]any{
+			"max":      l.Max,
+			"duration": l.DurationMs,
+		}
 	}
 	return msgpack.Marshal(m)
 }

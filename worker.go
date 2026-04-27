@@ -167,10 +167,29 @@ func (w *Worker) Stop(ctx context.Context) error {
 	}
 }
 
+// prefetchedJob is what moveToFinished's fetchNext branch returns:
+// the next job already locked under the same token the worker just
+// used for the finishing job. The dispatcher consumes it on the next
+// loop iteration in lieu of calling moveToActive — saves one Redis
+// round-trip per processed job in steady state, halving the
+// dispatch-side EVALSHA load that caps consumer throughput.
+//
+// The token is reused across the prefetch handoff because BullMQ's
+// fetchNextJob lua re-locks the new job with the opts.token we
+// passed to moveToFinished; the worker side keeps that token alive
+// via processJob's heartbeat for the new job.
+type prefetchedJob struct {
+	jobMap map[string]string
+	jobID  string
+	token  string
+}
+
 // dispatchLoop is one slot of the goroutine pool. It repeatedly tries
 // to dequeue a job and process it; on empty pulls it picks the
 // tightest available wakeup signal:
 //
+//   - prefetched job already in hand (from previous moveToFinished
+//     fetchNext): consume directly, skip moveToActive
 //   - rate-limited (Lua returned a cooldown ms): precise sleep
 //   - delayed work scheduled (Lua returned the next-due ms): precise
 //     sleep until that timestamp (BZPopMin's 1s floor would overshoot
@@ -181,11 +200,22 @@ func (w *Worker) Stop(ctx context.Context) error {
 // Exits when runCtx is cancelled.
 func (w *Worker) dispatchLoop(handlerAny any) {
 	defer w.run.Done()
+	var prefetched *prefetchedJob
 	for {
 		if w.runCtx.Err() != nil {
 			return
 		}
-		processed, expireTimeMs, nextDelayedTs, err := w.tryOnce(handlerAny)
+		if prefetched != nil {
+			// Consume the prefetched job from the previous moveToFinished
+			// fetchNext. runJob covers both the defa fast-path and the
+			// regular handler path; the returned prefetched fuels the
+			// next iteration if the chain keeps producing.
+			pj := prefetched
+			prefetched = nil
+			prefetched = w.runJob(handlerAny, pj.token, pj.jobID, pj.jobMap)
+			continue
+		}
+		processed, gotPrefetched, expireTimeMs, nextDelayedTs, err := w.tryOnce(handlerAny)
 		if err != nil {
 			// 取得や lua 失敗はログ的扱い (worker は止めない)。
 			// 本格的なエラー報告チャネルは observability PR で導入。
@@ -197,6 +227,7 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 			continue
 		}
 		if processed {
+			prefetched = gotPrefetched
 			continue
 		}
 		if expireTimeMs > 0 {
@@ -335,14 +366,19 @@ func (w *Worker) runStalledCheck() error {
 }
 
 // tryOnce performs one dequeue attempt and, if successful, runs the
-// handler and finalises the job. Returns (processed, expireTimeMs,
-// nextDelayedTs, err): expireTimeMs is the rate-limit cooldown the
-// dispatcher should sleep before its next call (0 = no rate-limit
-// window); nextDelayedTs is the absolute ms timestamp of the
-// soonest-due delayed job (0 = none queued) so the dispatcher can
-// wake precisely on its target instead of overshooting via the
-// 1-second BZPopMin floor.
-func (w *Worker) tryOnce(handlerAny any) (bool, int64, int64, error) {
+// handler and finalises the job. Returns (processed, prefetched,
+// expireTimeMs, nextDelayedTs, err):
+//   - processed   — true if a job was dequeued and handed to runJob
+//   - prefetched  — the job moveToFinished's fetchNext returned for
+//     the dispatcher to consume on the next iteration; nil for retry
+//     paths (retryJob / moveToDelayed don't have fetchNext)
+//   - expireTimeMs — rate-limit cooldown the dispatcher should sleep
+//     before its next call (0 = no rate-limit window)
+//   - nextDelayedTs — absolute ms timestamp of the soonest-due
+//     delayed job (0 = none queued) so the dispatcher can wake
+//     precisely on its target instead of overshooting via BZPopMin's
+//     1-second floor
+func (w *Worker) tryOnce(handlerAny any) (bool, *prefetchedJob, int64, int64, error) {
 	token := uuid.NewString()
 	now := time.Now().UnixMilli()
 
@@ -359,7 +395,7 @@ func (w *Worker) tryOnce(handlerAny any) (bool, int64, int64, error) {
 	}
 	optsBytes, err := proto.EncodeMoveToActiveOpts(mtaOpts)
 	if err != nil {
-		return false, 0, 0, fmt.Errorf("encode moveToActive opts: %w", err)
+		return false, nil, 0, 0, fmt.Errorf("encode moveToActive opts: %w", err)
 	}
 
 	res, err := w.scripts.Run(
@@ -372,29 +408,40 @@ func (w *Worker) tryOnce(handlerAny any) (bool, int64, int64, error) {
 	)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return false, 0, 0, nil
+			return false, nil, 0, 0, nil
 		}
-		return false, 0, 0, fmt.Errorf("moveToActive: %w", err)
+		return false, nil, 0, 0, fmt.Errorf("moveToActive: %w", err)
 	}
 
 	jobMap, jobID, ok, expireTimeMs, nextDelayedTs, err := parseMoveToActiveResult(res)
 	if err != nil {
-		return false, 0, 0, fmt.Errorf("parse moveToActive: %w", err)
+		return false, nil, 0, 0, fmt.Errorf("parse moveToActive: %w", err)
 	}
 	if !ok {
-		return false, expireTimeMs, nextDelayedTs, nil
+		return false, nil, expireTimeMs, nextDelayedTs, nil
 	}
 
-	// `defa` (default failed reason) is set by moveStalledJobsToWait
-	// when a job has been reclaimed more than maxStalledCount times.
-	// BullMQ's worker contract is to skip the handler and finalise
-	// straight to failed; running the handler again would re-stall
-	// the job in an infinite loop. moveToFinished's failed branch
-	// HDELs the field so a re-acquired but recovered job won't
-	// short-circuit on stale state.
+	prefetched := w.runJob(handlerAny, token, jobID, jobMap)
+	return true, prefetched, 0, 0, nil
+}
+
+// runJob handles one acquired job: defa fast-path or normal handler
+// dispatch. Returns the prefetched job moveToFinished's fetchNext
+// returned (or nil if the path didn't go through moveToFinished, e.g.
+// retry-immediate / retry-delayed).
+//
+// `defa` (default failed reason) is set by moveStalledJobsToWait
+// when a job has been reclaimed more than maxStalledCount times.
+// BullMQ's worker contract is to skip the handler and finalise
+// straight to failed; running the handler again would re-stall the
+// job in an infinite loop. moveToFinished's failed branch HDELs the
+// field so a re-acquired but recovered job won't short-circuit on
+// stale state.
+func (w *Worker) runJob(handlerAny any, token, jobID string, jobMap map[string]string) *prefetchedJob {
 	if defa, hasDefa := jobMap["defa"]; hasDefa && defa != "" {
 		jobOpts := parseJobOpts(jobMap["opts"])
-		if err := w.finishFailed(jobID, token, jobOpts, defa, mustJSONString([]string{defa})); err != nil {
+		prefetched, err := w.finishFailed(jobID, token, jobOpts, defa, mustJSONString([]string{defa}))
+		if err != nil {
 			// Best-effort lock cleanup matches the processJob path.
 			_, _ = w.scripts.Run(
 				context.Background(),
@@ -404,22 +451,25 @@ func (w *Worker) tryOnce(handlerAny any) (bool, int64, int64, error) {
 				w.cfg.lockDuration.Milliseconds(),
 			)
 		}
-		return true, 0, 0, nil
+		return prefetched
 	}
-
-	w.processJob(handlerAny, token, jobID, jobMap)
-	return true, 0, 0, nil
+	return w.processJob(handlerAny, token, jobID, jobMap)
 }
 
 // processJob runs the handler for one acquired job, manages the lock
 // heartbeat, and writes the terminal state via the appropriate
 // BullMQ Lua script (moveToFinished / retryJob / moveToDelayed).
 //
+// Returns the prefetched job from moveToFinished's fetchNext branch
+// (nil if the outcome went through retryJob / moveToDelayed which
+// don't support fetchNext). Caller (dispatchLoop) consumes the
+// prefetched job on its next iteration without a moveToActive RTT.
+//
 // The per-job ctx is derived from runCtx so worker shutdown propagates
 // without a separate bridge goroutine. Heartbeat owns its own goroutine
 // because the BullMQ extendLock semantics require periodic ticks
 // independent of handler progress.
-func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[string]string) {
+func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[string]string) *prefetchedJob {
 	jobCtx, cancelJob := context.WithCancel(w.runCtx)
 	defer cancelJob()
 
@@ -433,7 +483,8 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 	cancelJob()
 	<-hbDone
 
-	if err := w.finalise(jobID, token, jobMap, outcome); err != nil {
+	prefetched, err := w.finalise(jobID, token, jobMap, outcome)
+	if err != nil {
 		// Best-effort lock cleanup so a failed terminal call doesn't
 		// strand the lock for the full TTL.
 		_, _ = w.scripts.Run(
@@ -452,6 +503,8 @@ func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[stri
 	if rjk := jobMap["rjk"]; rjk != "" {
 		w.rescheduleNext(rjk, jobID)
 	}
+
+	return prefetched
 }
 
 // handlerOutcome captures the result of invoking a handler. Exactly
@@ -670,7 +723,13 @@ func asString(v any) string {
 // re-enqueue) or moveToDelayed (backoff-delayed re-enqueue), bumping
 // the BullMQ HASH `atm` (attempts made) counter atomically inside
 // the script.
-func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out handlerOutcome) error {
+//
+// Returns the prefetched job from moveToFinished's fetchNext branch
+// when the path goes through finishCompleted / finishFailed. Retry
+// paths (retryJob / moveToDelayed) never produce a prefetched job
+// because their Lua scripts don't support fetchNext — those return
+// (nil, err).
+func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out handlerOutcome) (*prefetchedJob, error) {
 	jobOpts := parseJobOpts(jobMap["opts"])
 
 	if out.success {
@@ -690,15 +749,15 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 
 	delay := computeBackoffDelay(jobOpts.backoff, atm+1)
 	if delay > 0 {
-		return w.retryDelayed(jobID, token, delay, out.errReason, out.stacktrace)
+		return nil, w.retryDelayed(jobID, token, delay, out.errReason, out.stacktrace)
 	}
-	return w.retryImmediate(jobID, token, jobOpts.lifo, out.errReason, out.stacktrace)
+	return nil, w.retryImmediate(jobID, token, jobOpts.lifo, out.errReason, out.stacktrace)
 }
 
 // finishCompleted writes the BullMQ completed-state transition.
 // jobOpts.removeOnComplete is forwarded into MoveToFinishedOpts.KeepJobs
 // so the vendored Lua trims the completed ZSET per BullMQ semantics.
-func (w *Worker) finishCompleted(jobID, token string, opts jobOpts, returnValue string) error {
+func (w *Worker) finishCompleted(jobID, token string, opts jobOpts, returnValue string) (*prefetchedJob, error) {
 	return w.runMoveToFinished(jobID, token, opts.attempts, opts.removeOnComplete,
 		"completed", "returnvalue", returnValue, nil)
 }
@@ -708,7 +767,7 @@ func (w *Worker) finishCompleted(jobID, token string, opts jobOpts, returnValue 
 // vendored Lua only emits `retries-exhausted` when retries are
 // genuinely exhausted; jobOpts.removeOnFail drives failed ZSET
 // retention.
-func (w *Worker) finishFailed(jobID, token string, opts jobOpts, reason, stacktrace string) error {
+func (w *Worker) finishFailed(jobID, token string, opts jobOpts, reason, stacktrace string) (*prefetchedJob, error) {
 	return w.runMoveToFinished(jobID, token, opts.attempts, opts.removeOnFail,
 		"failed", "failedReason", reason,
 		[]any{"stacktrace", stacktrace})
@@ -719,7 +778,17 @@ func (w *Worker) finishFailed(jobID, token string, opts jobOpts, reason, stacktr
 // alongside the state change. keep is the per-target retention
 // (nil = keep all, count==0 = remove immediately, count>0 = keep last
 // n; age trims by seconds since timestamp).
-func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *retentionLimit, target, msgProperty, msgValue string, extraFields []any) error {
+//
+// Passes ARGV[6]="1" (BullMQ's fetchNext sentinel) so the Lua's
+// fetchNextJob helper opportunistically dequeues the next wait /
+// prioritized job under the same lock token. When the wait list is
+// non-empty the response is the dequeued job's HGETALL array (same
+// shape moveToActive returns); when empty the response is the
+// regular completion code. Caller consumes the prefetched job on
+// the next dispatchLoop iteration without a moveToActive RTT —
+// halving the dispatch-side EVALSHA load that caps consumer
+// throughput vs BullMQ TS at high concurrency.
+func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *retentionLimit, target, msgProperty, msgValue string, extraFields []any) (*prefetchedJob, error) {
 	now := time.Now().UnixMilli()
 
 	optsArgs := proto.MoveToFinishedOpts{
@@ -727,6 +796,16 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *rete
 		LockDuration: w.cfg.lockDuration.Milliseconds(),
 		Attempts:     attempts,
 		Name:         w.cfg.workerName,
+	}
+	// fetchNext=1 の lua 経路 (fetchNextJob) は opts['limiter'] を読んで
+	// rate limit gating する。worker config に limiter があればここで
+	// 引き渡す — 無いと fetchNext が rate limit を bypass してテストが
+	// 通らない (TestWorker_RateLimit_Throttles 等)。
+	if l := w.cfg.limiter; l != nil {
+		optsArgs.Limiter = &proto.MoveToActiveLimiter{
+			Max:        l.max,
+			DurationMs: l.duration.Milliseconds(),
+		}
 	}
 	if keep != nil {
 		kj := &proto.KeepJobs{Count: keep.count}
@@ -737,7 +816,7 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *rete
 	}
 	optsBytes, err := proto.EncodeMoveToFinishedOpts(optsArgs)
 	if err != nil {
-		return fmt.Errorf("encode finish opts: %w", err)
+		return nil, fmt.Errorf("encode finish opts: %w", err)
 	}
 
 	// `finishedOn` を ARGV[9] に積まない: moveToFinished-14.lua が
@@ -746,7 +825,7 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *rete
 	// updateData 設計と揃える。
 	jobFields, err := proto.EncodeJobFields(extraFields...)
 	if err != nil {
-		return fmt.Errorf("encode job fields: %w", err)
+		return nil, fmt.Errorf("encode job fields: %w", err)
 	}
 
 	keys := w.keys.moveToFinishedKeys(jobID, target)
@@ -759,18 +838,34 @@ func (w *Worker) runMoveToFinished(jobID, token string, attempts int, keep *rete
 		msgProperty,
 		msgValue,
 		target,
-		"", // fetchNext=false: empty string is BullMQ's "do not fetch" sentinel
+		"1", // fetchNext=true: opportunistically grab the next job under the same token
 		w.keys.prefix,
 		optsBytes,
 		jobFields,
 	)
 	if err != nil {
-		return fmt.Errorf("moveToFinished(%s): %w", target, err)
+		return nil, fmt.Errorf("moveToFinished(%s): %w", target, err)
 	}
-	if code, ok := res.(int64); ok && code < 0 {
-		return fmt.Errorf("moveToFinished(%s) returned error code %d", target, code)
+	// Polymorphic response: int64 = no fetched job (success / error code);
+	// []any = fetchNext returned the next job's data (or a no-job branch).
+	if code, ok := res.(int64); ok {
+		if code < 0 {
+			return nil, fmt.Errorf("moveToFinished(%s) returned error code %d", target, code)
+		}
+		return nil, nil
 	}
-	return nil
+	jobMap, prefetchedID, gotJob, _, _, perr := parseMoveToActiveResult(res)
+	if perr != nil {
+		return nil, fmt.Errorf("moveToFinished(%s) parse fetchNext: %w", target, perr)
+	}
+	if !gotJob {
+		// fetchNextJob returned a no-job branch (rate-limited / paused /
+		// idle). Treat as plain success — dispatcher's next iteration
+		// will hit moveToActive normally and pick up whichever signal
+		// applies.
+		return nil, nil
+	}
+	return &prefetchedJob{jobMap: jobMap, jobID: prefetchedID, token: token}, nil
 }
 
 // retryImmediate re-enqueues a failed job via retryJob-11.lua. The Lua
