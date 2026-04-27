@@ -4,12 +4,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
+
+// Logger is the minimal logging surface lua.Scripter uses for
+// NOSCRIPT-reload diagnostics. Decoupled from mkq.Logger to avoid
+// an internal->root import cycle; mkq.Logger satisfies this
+// interface implicitly because mkq.Logger.Debug shares the same
+// (string, ...slog.Attr) signature.
+type Logger interface {
+	Debug(msg string, attrs ...slog.Attr)
+}
+
+type noopLogger struct{}
+
+func (noopLogger) Debug(string, ...slog.Attr) {}
 
 // ScriptName identifies a vendored entry-point script.
 type ScriptName string
@@ -46,6 +60,7 @@ const (
 // A Scripter is safe for concurrent use.
 type Scripter struct {
 	client redis.Scripter
+	logger Logger
 
 	mu      sync.RWMutex
 	scripts map[ScriptName]*loadedScript
@@ -66,9 +81,16 @@ type loadedScript struct {
 // NewScripter resolves and pre-loads the vendored entry-point scripts
 // against the given Redis client. The returned Scripter caches each
 // script's SHA so subsequent calls round-trip a single EVALSHA.
-func NewScripter(ctx context.Context, client redis.Scripter) (*Scripter, error) {
+//
+// logger may be nil; in that case a noop is used. Only NOSCRIPT-reload
+// events are currently logged (Debug level).
+func NewScripter(ctx context.Context, client redis.Scripter, logger Logger) (*Scripter, error) {
+	if logger == nil {
+		logger = noopLogger{}
+	}
 	s := &Scripter{
 		client:  client,
+		logger:  logger,
 		scripts: make(map[ScriptName]*loadedScript),
 	}
 	for _, name := range []ScriptName{
@@ -102,7 +124,12 @@ func (s *Scripter) Run(ctx context.Context, name ScriptName, keys []string, args
 	if !isNoScript(err) {
 		return nil, err
 	}
-	// NOSCRIPT: Redisがflushされた等。再ロードして1度だけrety。
+	// NOSCRIPT: Redisがflushされた等。再ロードして1度だけretry。
+	// 通常は発生しないが、Redis flush / restart 後の最初のRunで観測
+	// される。Ops が flush の発生を検知できるよう Debug log を残す。
+	s.logger.Debug("mkq: lua script reload after NOSCRIPT",
+		slog.String("script", string(name)),
+	)
 	ls, err = s.load(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("reload %s after NOSCRIPT: %w", name, err)
