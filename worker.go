@@ -168,19 +168,29 @@ func (w *Worker) Stop(ctx context.Context) error {
 }
 
 // dispatchLoop is one slot of the goroutine pool. It repeatedly tries
-// to dequeue a job and process it, sleeping IdlePollInterval between
-// empty pulls (or the rate-limit cooldown if Lua reported one) and
-// exiting when runCtx is cancelled.
+// to dequeue a job and process it; on empty pulls it picks the
+// tightest available wakeup signal:
+//
+//   - rate-limited (Lua returned a cooldown ms): precise sleep
+//   - delayed work scheduled (Lua returned the next-due ms): precise
+//     sleep until that timestamp (BZPopMin's 1s floor would overshoot
+//     sub-second delayed targets like exponential-backoff retries)
+//   - truly idle: BZPopMin on the BullMQ marker key, waking ms after
+//     a new wait/prioritized job lands
+//
+// Exits when runCtx is cancelled.
 func (w *Worker) dispatchLoop(handlerAny any) {
 	defer w.run.Done()
 	for {
 		if w.runCtx.Err() != nil {
 			return
 		}
-		processed, expireTimeMs, err := w.tryOnce(handlerAny)
+		processed, expireTimeMs, nextDelayedTs, err := w.tryOnce(handlerAny)
 		if err != nil {
 			// 取得や lua 失敗はログ的扱い (worker は止めない)。
 			// 本格的なエラー報告チャネルは observability PR で導入。
+			// エラー時は marker を待たずに idle interval だけ眠る:
+			// 連続失敗時に hot-loop しないため。
 			if !w.sleep(w.cfg.idlePollInterval) {
 				return
 			}
@@ -189,14 +199,39 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 		if processed {
 			continue
 		}
-		// Rate-limited path: respect the precise cooldown the Lua
-		// returned via expireTime instead of falling through to the
-		// idle poll interval.
-		wait := w.cfg.idlePollInterval
 		if expireTimeMs > 0 {
-			wait = time.Duration(expireTimeMs) * time.Millisecond
+			// Rate-limited: precise cooldown the Lua reported. Don't
+			// short-circuit on marker — we'd hammer moveToActive with
+			// rate-limit-rejected calls.
+			if !w.sleep(time.Duration(expireTimeMs) * time.Millisecond) {
+				return
+			}
+			continue
 		}
-		if !w.sleep(wait) {
+		if nextDelayedTs > 0 {
+			// 次 delayed job の絶対 ms timestamp が分かるので、precise
+			// sleep でその時刻まで待つ。BZPopMin の 1s floor だと
+			// sub-second delayed (e.g. 50ms exp-backoff retry) で
+			// overshoot する。delay <= 0 はもう due なので即時 retry。
+			delay := time.Until(time.UnixMilli(nextDelayedTs))
+			if delay <= 0 {
+				continue
+			}
+			// idlePollInterval を上限とし、delay が長くても worker が
+			// 完全 unresponsive にならないようにする。BZPopMin で待つ
+			// のと違い、新しい wait-list job 到着では起きないが、
+			// delay > idlePollInterval なら次 iter で marker 待ちに
+			// 切り替わる (= sparse-arrival ケースでも応答性維持)。
+			if delay > w.cfg.idlePollInterval {
+				delay = w.cfg.idlePollInterval
+			}
+			if !w.sleep(delay) {
+				return
+			}
+			continue
+		}
+		// Idle queue: wake on marker push or timeout.
+		if !w.awaitMarker(w.cfg.idlePollInterval) {
 			return
 		}
 	}
@@ -216,6 +251,45 @@ func (w *Worker) sleep(d time.Duration) bool {
 	case <-w.runCtx.Done():
 		return false
 	}
+}
+
+// awaitMarker blocks waiting for a push to the BullMQ marker key
+// (`{prefix}:{queue}:marker`). The vendored add* / promote /
+// moveToFinished Lua scripts add to the marker whenever new work
+// becomes available, so this wakes within ms of a job landing — far
+// tighter than the previous polling-and-sleep approach.
+//
+// Redis BZPOPMIN's protocol-level timeout is second-granularity
+// (Redis 6+ accepts fractional seconds, but go-redis floors anything
+// below 1s with a warning log); we therefore clamp the BZPopMin
+// timeout to at least 1s. Sub-second responsiveness still works in
+// the only case that matters: a real job landing fires a marker
+// push that wakes BZPopMin within ms regardless of the configured
+// ceiling. ctx cancellation is unaffected — go-redis's v9 Cmd.Result
+// returns ctx.Err immediately when the parent context is cancelled,
+// so Worker.Stop's shutdown latency is not bounded by this floor.
+//
+// Any error response (redis.Nil for timeout, context.Canceled for
+// shutdown, transient network glitches) becomes a "wake and retry"
+// signal: tryOnce is idempotent so spurious wakeups are cheap, and a
+// real Redis outage will surface in the next tryOnce call. Returns
+// false when runCtx is cancelled so the dispatcher can exit cleanly.
+//
+// Connection-pool sizing note: each worker slot occupies one Redis
+// connection while blocked here. A WithConcurrency(N) worker plus
+// the queue's own per-call traffic typically wants pool size >= N+8.
+// go-redis defaults to 10*GOMAXPROCS which is comfortable for
+// concurrencies up to a few dozen; very high concurrency callers
+// should bump UniversalOptions.PoolSize.
+func (w *Worker) awaitMarker(timeout time.Duration) bool {
+	if timeout <= 0 {
+		return w.runCtx.Err() == nil
+	}
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	_ = w.rdb.BZPopMin(w.runCtx, timeout, w.keys.marker).Err()
+	return w.runCtx.Err() == nil
 }
 
 // stalledLoop fires moveStalledJobsToWait at the configured interval.
@@ -262,9 +336,13 @@ func (w *Worker) runStalledCheck() error {
 
 // tryOnce performs one dequeue attempt and, if successful, runs the
 // handler and finalises the job. Returns (processed, expireTimeMs,
-// err): expireTimeMs is the rate-limit cooldown the dispatcher
-// should sleep before its next call (0 = no rate-limit window).
-func (w *Worker) tryOnce(handlerAny any) (bool, int64, error) {
+// nextDelayedTs, err): expireTimeMs is the rate-limit cooldown the
+// dispatcher should sleep before its next call (0 = no rate-limit
+// window); nextDelayedTs is the absolute ms timestamp of the
+// soonest-due delayed job (0 = none queued) so the dispatcher can
+// wake precisely on its target instead of overshooting via the
+// 1-second BZPopMin floor.
+func (w *Worker) tryOnce(handlerAny any) (bool, int64, int64, error) {
 	token := uuid.NewString()
 	now := time.Now().UnixMilli()
 
@@ -281,7 +359,7 @@ func (w *Worker) tryOnce(handlerAny any) (bool, int64, error) {
 	}
 	optsBytes, err := proto.EncodeMoveToActiveOpts(mtaOpts)
 	if err != nil {
-		return false, 0, fmt.Errorf("encode moveToActive opts: %w", err)
+		return false, 0, 0, fmt.Errorf("encode moveToActive opts: %w", err)
 	}
 
 	res, err := w.scripts.Run(
@@ -294,17 +372,17 @@ func (w *Worker) tryOnce(handlerAny any) (bool, int64, error) {
 	)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return false, 0, nil
+			return false, 0, 0, nil
 		}
-		return false, 0, fmt.Errorf("moveToActive: %w", err)
+		return false, 0, 0, fmt.Errorf("moveToActive: %w", err)
 	}
 
-	jobMap, jobID, ok, expireTimeMs, err := parseMoveToActiveResult(res)
+	jobMap, jobID, ok, expireTimeMs, nextDelayedTs, err := parseMoveToActiveResult(res)
 	if err != nil {
-		return false, 0, fmt.Errorf("parse moveToActive: %w", err)
+		return false, 0, 0, fmt.Errorf("parse moveToActive: %w", err)
 	}
 	if !ok {
-		return false, expireTimeMs, nil
+		return false, expireTimeMs, nextDelayedTs, nil
 	}
 
 	// `defa` (default failed reason) is set by moveStalledJobsToWait
@@ -326,11 +404,11 @@ func (w *Worker) tryOnce(handlerAny any) (bool, int64, error) {
 				w.cfg.lockDuration.Milliseconds(),
 			)
 		}
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 
 	w.processJob(handlerAny, token, jobID, jobMap)
-	return true, 0, nil
+	return true, 0, 0, nil
 }
 
 // processJob runs the handler for one acquired job, manages the lock
@@ -991,29 +1069,32 @@ func buildJob[T any](jobID string, jobMap map[string]string) (*Job[T], error) {
 //   - {0, 0, 0, 0} when paused / maxed / empty
 //
 // expireTimeMs surfaces the rate-limit cooldown so dispatchLoop can
-// sleep precisely instead of falling through to idlePollInterval.
-func parseMoveToActiveResult(res any) (jobMap map[string]string, jobID string, ok bool, expireTimeMs int64, err error) {
+// sleep precisely. nextDelayedTs surfaces the next delayed job's
+// absolute target ms timestamp so dispatchLoop can sleep until it
+// (BZPopMin's 1s floor would otherwise overshoot sub-1s delays).
+func parseMoveToActiveResult(res any) (jobMap map[string]string, jobID string, ok bool, expireTimeMs int64, nextDelayedTs int64, err error) {
 	arr, isArr := res.([]any)
 	if !isArr || len(arr) < 4 {
-		return nil, "", false, 0, nil
+		return nil, "", false, 0, 0, nil
 	}
 	jobData, isJobData := arr[0].([]any)
 	if !isJobData {
-		// arr[0] が integer (=0) のとき = job 無し。Slot 3 (1-indexed
-		// なら ARGV の解説と同じだが Go では index 2) が rate-limit の
-		// expireTime ms。
+		// arr[0] が integer (=0) のとき = job 無し。Slot 2 (Go index)
+		// は rate-limit の expireTime ms、Slot 3 は次 delayed job の
+		// 絶対時刻 (ms)。dispatchLoop はこれを使って precise sleep する。
 		expireTimeMs, _ = toInt64(arr[2])
-		return nil, "", false, expireTimeMs, nil
+		nextDelayedTs, _ = toInt64(arr[3])
+		return nil, "", false, expireTimeMs, nextDelayedTs, nil
 	}
 	id, idOK := arr[1].(string)
 	if !idOK || id == "" {
-		return nil, "", false, 0, nil
+		return nil, "", false, 0, 0, nil
 	}
 	m, err := flatHashToMap(jobData)
 	if err != nil {
-		return nil, "", false, 0, err
+		return nil, "", false, 0, 0, err
 	}
-	return m, id, true, 0, nil
+	return m, id, true, 0, 0, nil
 }
 
 // toInt64 normalises the integer types go-redis can surface for an
