@@ -1,0 +1,9 @@
+{
+  "name": "mkq-bench",
+  "private": true,
+  "type": "module",
+  "description": "BullMQ TS counterpart of bench/go for the mkq vs BullMQ throughput / latency comparison.",
+  "dependencies": {
+    "bullmq": "5.76.2"
+  }
+}
