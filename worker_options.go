@@ -49,11 +49,25 @@ func WithWorkerName(name string) WorkerOption {
 	return func(c *workerConfig) { c.workerName = name }
 }
 
-// WithIdlePollInterval controls how long the worker sleeps between
-// moveToActive calls when no job is available. A shorter value reduces
-// dequeue latency at the cost of Redis load. The marker-based blocking
-// dequeue (BullMQ's preferred path) is not yet implemented; this knob
-// is the temporary substitute.
+// WithIdlePollInterval bounds how long the worker may block waiting
+// for a marker-key push from the BullMQ Lua side. New jobs wake the
+// dispatcher within ms via BZPopMin on `{prefix}:{queue}:marker`;
+// this knob is the timeout ceiling that fires when nothing has
+// landed (e.g. so a Redis outage doesn't strand a worker indefinitely).
+//
+// Floor: Redis BZPOPMIN takes a second-granularity timeout (Redis 6+
+// supports fractional seconds, but go-redis floors anything below 1s
+// with a warning), so the effective floor is 1s regardless of what
+// you pass here. Sub-second values are harmless — they still drive
+// the dispatch-latency improvement (marker push wakes within ms) but
+// the BZPopMin ceiling stays at 1s. ctx cancellation is unaffected:
+// Worker.Stop returns immediately because go-redis honours ctx on
+// blocking commands.
+//
+// A blocked BZPopMin holds one Redis connection per worker slot, so
+// WithConcurrency(N) callers should ensure their go-redis
+// UniversalOptions.PoolSize is >= N + a few; the default
+// 10*GOMAXPROCS is plenty for concurrencies up to a few dozen.
 func WithIdlePollInterval(d time.Duration) WorkerOption {
 	return func(c *workerConfig) { c.idlePollInterval = d }
 }
