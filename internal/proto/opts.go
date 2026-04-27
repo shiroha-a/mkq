@@ -10,10 +10,13 @@ import (
 //
 // Field naming mirrors what BullMQ stores in the on-Redis HASH, which is
 // a JSON-ified version of this same map: long keys for non-compressable
-// fields (delay, priority, ...) and short keys ("de", ...) for the
-// fields listed in BullMQ's optsEncodeMap. Since the basic add path
-// touches none of the compressed fields, every key here uses the long
-// form.
+// fields (delay, priority, ...) and short keys for the fields listed in
+// BullMQ's optsEncodeMap. Most fields here use the long form because
+// the lua references them long, but a few (notably "de" for
+// Deduplication) use BullMQ's compressed key — the lua reads
+// `opts['de']` and round-tripping the long name would diverge from the
+// wire format. Add new compressed-key fields with the same explicit
+// note if BullMQ extends the map.
 type AddOpts struct {
 	// Delay is the delay before the job becomes eligible to run, in
 	// unix milliseconds offset.

@@ -115,6 +115,12 @@ func WithKeepFailedAge(age time.Duration) AddOption {
 // key sticks until the corresponding job is finalised; matches
 // BullMQ's "no ttl" branch).
 //
+// TTL resolution is one millisecond — sub-millisecond values
+// truncate to zero and therefore behave like ttl <= 0 (no auto-
+// expiry, key persists until job finalisation). Callers that
+// expected a microsecond-grained window should round up to the
+// nearest millisecond explicitly.
+//
 // Wire compatibility: this is BullMQ's `JobsOptions.deduplication`,
 // stored at `{prefix}:{queue}:de:<id>` with PX ttl. mkq's
 // implementation pre-GETs the dedup key before the EVAL to surface
