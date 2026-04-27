@@ -59,6 +59,13 @@ func TestInterop_StalledRecovery(t *testing.T) {
 	})
 
 	// Hard-kill BullMQ TS so its heartbeat stops extending the lock.
+	// startWorkerProcess registered a t.Cleanup that will SIGINT and
+	// re-Wait this same process; that's intentional and safe — Wait
+	// after a successful Wait returns "exec: Wait was already called",
+	// the cleanup discards the error via `_`. If a future change adds
+	// strict error checking to the cleanup path, this kill-then-wait
+	// dance must be relocated into its own Cleanup that fires before
+	// the helper's.
 	require.NoError(t, bullCmd.Process.Kill())
 	_ = bullCmd.Wait()
 

@@ -15,7 +15,6 @@
 package interop_test
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -23,7 +22,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -105,62 +103,16 @@ func waitFor(t *testing.T, ctx context.Context, step time.Duration, cond func() 
 	}
 }
 
-// startNodeWorker spawns the BullMQ TS worker as a subprocess. Returns
-// once worker.js prints {"event":"ready"} so callers can race the next
-// job submission without a fixed sleep. Cleanup is registered on t.
+// startNodeWorker spawns the BullMQ TS worker as a subprocess with
+// default options. Returns once worker.js prints {"event":"ready"}
+// so callers can race the next job submission without a fixed sleep.
+// Cleanup is registered on t.
+//
+// Thin wrapper over startNodeWorkerOpts so the ready-channel /
+// stdout-drain / cleanup machinery lives in exactly one place.
 func startNodeWorker(t *testing.T, prefix, queueName string) {
 	t.Helper()
-	dir := nodeDir(t)
-	cmd := exec.Command("node", "worker.js")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"INTEROP_REDIS="+redisAddr(),
-		"INTEROP_PREFIX="+prefix,
-		"INTEROP_QUEUE="+queueName,
-	)
-	stdout, err := cmd.StdoutPipe()
-	require.NoError(t, err)
-	cmd.Stderr = os.Stderr
-	require.NoError(t, cmd.Start())
-
-	// Drain stdout for the lifetime of the subprocess. We listen for
-	// {"event":"ready"} to release the caller, then keep draining
-	// (silently discarding) until EOF so any incidental console
-	// output BullMQ might emit later doesn't fill the OS pipe buffer
-	// (~64KB on Linux) and deadlock the worker on its next write.
-	ready := make(chan struct{})
-	var readyOnce sync.Once
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			var msg struct {
-				Event string `json:"event"`
-			}
-			if json.Unmarshal([]byte(line), &msg) == nil && msg.Event == "ready" {
-				readyOnce.Do(func() { close(ready) })
-			}
-		}
-	}()
-
-	t.Cleanup(func() {
-		_ = cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() { _ = cmd.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-	})
-
-	select {
-	case <-ready:
-	case <-time.After(15 * time.Second):
-		_ = cmd.Process.Kill()
-		t.Fatal("BullMQ worker never printed ready")
-	}
+	startNodeWorkerOpts(t, prefix, queueName, nodeWorkerOpts{})
 }
 
 // runNodeEnqueuer runs enqueuer.js once and returns the Job ID it

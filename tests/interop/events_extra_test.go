@@ -64,11 +64,16 @@ func TestInterop_Events_BullMQReadsMkqEmissions(t *testing.T) {
 	// Path 3: removing a wait/delayed job triggers the `removed` event.
 	require.NoError(t, queue.RemoveJob(ctx, delayedJob.ID))
 
+	// Every Path 1/2/3 trigger maps to an event we explicitly assert.
+	// Without this list the delayed-add and remove setup steps would
+	// be unverified work — Devin's PR #52 round-1 review caught that.
 	required := map[string]bool{
 		"added":     false,
 		"waiting":   false,
 		"active":    false,
 		"completed": false,
+		"delayed":   false,
+		"removed":   false,
 	}
 	deadline := time.After(8 * time.Second)
 	allSeen := func() bool {

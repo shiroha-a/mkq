@@ -67,7 +67,11 @@ func TestInterop_Dedup_BullMQThenMkq(t *testing.T) {
 	second, err := queue.Add(ctx, interopPayload{Inbox: "second"},
 		mkq.WithDeduplication("xlang2", 10*time.Second),
 	)
-	require.Error(t, err, "mkq must return ErrDuplicateJob when foreign-added job exists in dedup window")
-	assert.ErrorIs(t, err, mkq.ErrDuplicateJob)
+	// require.ErrorIs both stops on a non-dedup error AND validates
+	// the sentinel. `require.Error + assert.ErrorIs + second.ID`
+	// would panic with a nil deref if a real error (Redis hiccup,
+	// Lua failure) slipped through unnoticed.
+	require.ErrorIs(t, err, mkq.ErrDuplicateJob, "mkq must return ErrDuplicateJob when foreign-added job exists in dedup window")
+	require.NotNil(t, second, "ErrDuplicateJob path must still return the existing Job[T] handle")
 	assert.Equal(t, bullmqID, second.ID, "returned Job.ID must point at the existing BullMQ-side job")
 }
