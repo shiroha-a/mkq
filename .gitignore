@@ -36,3 +36,6 @@ go.work.sum
 
 # Node deps for interop harness (regenerated from package-lock.json)
 tests/interop/node/node_modules/
+
+# Node deps for benchmark harness (regenerated from package-lock.json)
+bench/node/node_modules/
