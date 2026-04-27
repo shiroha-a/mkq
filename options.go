@@ -23,6 +23,9 @@ type addConfig struct {
 	keepFailed       *int
 	keepCompletedAge *time.Duration
 	keepFailedAge    *time.Duration
+	dedupID          string
+	dedupTTL         time.Duration
+	dedupSet         bool // distinguishes "WithDeduplication never called" from "called with empty id"
 }
 
 // WithJobID forces the job id instead of letting Redis INCR allocate
@@ -100,4 +103,44 @@ func WithKeepCompletedAge(age time.Duration) AddOption {
 // WithKeepCompletedAge.
 func WithKeepFailedAge(age time.Duration) AddOption {
 	return func(c *addConfig) { c.keepFailedAge = &age }
+}
+
+// WithDeduplication opts the Add into BullMQ's deduplication wire
+// path. Within ttl from the previous Add carrying the same id, a
+// repeat Add does NOT create a new job — it returns the prior job's
+// handle alongside ErrDuplicateJob.
+//
+// id must be non-empty; an empty id surfaces as an error from
+// Queue.Add. ttl <= 0 disables auto-expiry of the dedup key (the
+// key sticks until the corresponding job is finalised; matches
+// BullMQ's "no ttl" branch).
+//
+// TTL resolution is one millisecond — sub-millisecond values
+// truncate to zero and therefore behave like ttl <= 0 (no auto-
+// expiry, key persists until job finalisation). Callers that
+// expected a microsecond-grained window should round up to the
+// nearest millisecond explicitly.
+//
+// Wire compatibility: this is BullMQ's `JobsOptions.deduplication`,
+// stored at `{prefix}:{queue}:de:<id>` with PX ttl. mkq's
+// implementation pre-GETs the dedup key before the EVAL to surface
+// ErrDuplicateJob; the detection is best-effort under concurrent
+// writers.
+func WithDeduplication(id string, ttl time.Duration) AddOption {
+	return func(c *addConfig) {
+		c.dedupID = id
+		c.dedupTTL = ttl
+		c.dedupSet = true
+	}
+}
+
+// WithUnique is the asynq-compat alias for WithDeduplication. Lets
+// mk-go's adapter keep the asynq.Unique(ttl) call sites readable
+// while internally translating to BullMQ's wire path.
+//
+// asynq derives the dedup id from `task.Type() + sha256(payload)`;
+// adapters that want strict asynq parity should reproduce that
+// derivation when constructing the id arg.
+func WithUnique(id string, ttl time.Duration) AddOption {
+	return WithDeduplication(id, ttl)
 }
