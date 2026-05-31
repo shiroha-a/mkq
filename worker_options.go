@@ -14,6 +14,7 @@ type workerConfig struct {
 	maxStalledCount  int
 	limiter          *workerLimiter
 	maxDataPoints    int // 0 = disabled (BullMQ-spec metrics off)
+	backoffStrategy  CustomBackoffFunc
 }
 
 type workerLimiter struct {
@@ -115,6 +116,26 @@ func WithRateLimit(max int, duration time.Duration) WorkerOption {
 		}
 		c.limiter = &workerLimiter{max: max, duration: duration}
 	}
+}
+
+// WithBackoffStrategy registers the computation for jobs whose backoff
+// Type is not a BullMQ built-in (i.e. "custom"). It is the analogue of
+// BullMQ's `new Worker(..., { settings: { backoffStrategy } })`.
+//
+// Pair it with CustomBackoff() on the Add side: the job is stored with
+// {"type":"custom"} and this function computes the per-attempt delay.
+// Because the cap / jitter / formula all live here, mk-go can reproduce
+// Misskey's httpRelatedBackoff verbatim, e.g.:
+//
+//	mkq.WithBackoffStrategy(func(attemptsMade int) time.Duration {
+//		const base = time.Minute
+//		const cap = 8 * time.Hour
+//		d := time.Duration(math.Pow(2, float64(attemptsMade))-1) * base
+//		d = min(d, cap)
+//		return d + time.Duration(rand.Float64()*0.2*float64(d))
+//	})
+func WithBackoffStrategy(fn CustomBackoffFunc) WorkerOption {
+	return func(c *workerConfig) { c.backoffStrategy = fn }
 }
 
 // WithJobMetrics enables BullMQ-spec per-minute job-count metrics

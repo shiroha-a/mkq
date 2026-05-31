@@ -255,8 +255,9 @@ func toProtoOpts(cfg addConfig, delayMs int64) proto.AddOpts {
 	}
 	if cfg.backoff != nil {
 		o.Backoff = &proto.Backoff{
-			Type:  cfg.backoff.Type,
-			Delay: cfg.backoff.Delay.Milliseconds(),
+			Type:   cfg.backoff.Type,
+			Delay:  cfg.backoff.Delay.Milliseconds(),
+			Jitter: cfg.backoff.Jitter,
 		}
 	}
 	if cfg.dedupID != "" {

@@ -241,13 +241,14 @@ the asynq → mkq migration walkthrough.
 ## Features
 
 - **Job lifecycle**: Add / Process / retry-on-error / WithAttempts /
-  WithBackoff (Fixed, Exponential) / panic recovery / ErrUnrecoverable.
+  WithBackoff (Fixed, Exponential, jitter, custom strategy) / panic
+  recovery / ErrUnrecoverable.
 - **Job options**: WithDelay, WithPriority, WithLifo,
   WithKeepCompleted/Failed (count + age), WithDeduplication / WithUnique,
   WithJobName, WithJobID.
 - **Worker options**: WithConcurrency, WithLockDuration,
   WithStalledInterval, WithMaxStalledCount, WithIdlePollInterval,
-  WithRateLimit, WithWorkerName.
+  WithRateLimit, WithWorkerName, WithBackoffStrategy, WithJobMetrics.
 - **Recurring schedules**: every-mode and cron-pattern mode, with
   WithScheduleLimit / StartDate / EndDate / Timezone / Immediately.
 - **QueueEvents**: subscribe to BullMQ's `events` stream

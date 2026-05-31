@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -55,6 +56,16 @@ type Worker struct {
 	logger    Logger
 	metrics   Metrics
 	tracer    Tracer
+
+	// backoffStrategy is the BullMQ settings.backoffStrategy analogue:
+	// invoked for jobs whose backoff Type is not a built-in (fixed /
+	// exponential). nil means custom-typed jobs fall back to immediate
+	// retry. See WithBackoffStrategy.
+	backoffStrategy CustomBackoffFunc
+	// rng returns a random float64 in [0, 1) for jitter. Defaults to
+	// math/rand/v2's package source; overridable in tests for
+	// deterministic jitter assertions.
+	rng func() float64
 
 	// runCtx is cancelled by Stop to break dispatch goroutines out of
 	// the dequeue loop. Each in-flight handler derives its job ctx
@@ -124,17 +135,19 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &Worker{
-		cfg:       cfg,
-		keys:      newQueueKeys(q),
-		queueName: q.name,
-		scripts:   q.client.scripts,
-		rdb:       q.client.rdb,
-		logger:    q.client.logger,
-		metrics:   q.client.metrics,
-		tracer:    q.client.tracer,
-		runCtx:    ctx,
-		runCancel: cancel,
-		stopDone:  make(chan struct{}),
+		cfg:             cfg,
+		keys:            newQueueKeys(q),
+		queueName:       q.name,
+		scripts:         q.client.scripts,
+		rdb:             q.client.rdb,
+		logger:          q.client.logger,
+		metrics:         q.client.metrics,
+		tracer:          q.client.tracer,
+		runCtx:          ctx,
+		runCancel:       cancel,
+		stopDone:        make(chan struct{}),
+		backoffStrategy: cfg.backoffStrategy,
+		rng:             rand.Float64,
 	}
 
 	// BZPopMin の awaitMarker は worker slot ごとに 1 connection を専有
@@ -903,7 +916,7 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 		return pf, finaliseStatusFailed, nil
 	}
 
-	delay := computeBackoffDelay(jobOpts.backoff, atm+1)
+	delay := w.computeRetryDelay(jobOpts.backoff, atm+1)
 	if delay > 0 {
 		if err := w.retryDelayed(jobID, token, delay, out.errReason, out.stacktrace); err != nil {
 			return nil, finaliseStatusError, err
@@ -1152,6 +1165,36 @@ func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason, 
 	return nil
 }
 
+// computeRetryDelay resolves the per-attempt retry delay for a job,
+// layering jitter and the custom strategy on top of the built-in
+// fixed / exponential base computed by computeBackoffDelay.
+//
+// For built-in types the un-jittered base is computed wire-faithfully
+// and, when BackoffStrategy.Jitter > 0, spread via applyJitter using
+// the BullMQ formula. For any non-built-in type ("custom") the
+// Worker-registered CustomBackoffFunc owns the entire computation
+// (formula + cap + jitter); with no strategy registered the job falls
+// back to immediate retry (delay 0) rather than panicking, so foreign
+// custom-typed jobs never wedge the worker.
+func (w *Worker) computeRetryDelay(b *BackoffStrategy, attemptsMade int) time.Duration {
+	if b == nil || attemptsMade < 1 {
+		return 0
+	}
+	switch b.Type {
+	case "fixed", "exponential":
+		base := computeBackoffDelay(b, attemptsMade)
+		if b.Jitter > 0 {
+			return applyJitter(base, b.Jitter, w.rng())
+		}
+		return base
+	default:
+		if w.backoffStrategy != nil {
+			return w.backoffStrategy(attemptsMade)
+		}
+		return 0
+	}
+}
+
 // jobOpts is the subset of the per-job opts JSON that the worker
 // needs after dequeue. The on-Redis HASH `opts` field is the JSON
 // shape produced by Job.optsAsJSON in BullMQ TS.
@@ -1247,13 +1290,14 @@ func parseRemoveOpt(raw json.RawMessage) *retentionLimit {
 	return nil
 }
 
-// parseBackoffOpt accepts BullMQ's `number | {type, delay}` shape:
+// parseBackoffOpt accepts BullMQ's `number | {type, delay, jitter}`
+// shape:
 //
-//	number N           -> &BackoffStrategy{Type:"fixed", Delay: N ms}
-//	{type, delay}      -> &BackoffStrategy{Type, Delay}
+//	number N                   -> &BackoffStrategy{Type:"fixed", Delay: N ms}
+//	{type, delay, jitter?}     -> &BackoffStrategy{Type, Delay, Jitter}
 //
-// Empty / null / unrecognised shapes return nil so callers fall back
-// to the no-backoff default.
+// jitter is optional (defaults to 0). Empty / null / unrecognised
+// shapes return nil so callers fall back to the no-backoff default.
 func parseBackoffOpt(raw json.RawMessage) *BackoffStrategy {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil
@@ -1266,13 +1310,15 @@ func parseBackoffOpt(raw json.RawMessage) *BackoffStrategy {
 		}
 	}
 	var obj struct {
-		Type  string `json:"type"`
-		Delay int64  `json:"delay"`
+		Type   string  `json:"type"`
+		Delay  int64   `json:"delay"`
+		Jitter float64 `json:"jitter"`
 	}
 	if err := json.Unmarshal(raw, &obj); err == nil && obj.Type != "" {
 		return &BackoffStrategy{
-			Type:  obj.Type,
-			Delay: time.Duration(obj.Delay) * time.Millisecond,
+			Type:   obj.Type,
+			Delay:  time.Duration(obj.Delay) * time.Millisecond,
+			Jitter: obj.Jitter,
 		}
 	}
 	return nil
