@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-06-01
+
+### Added
+
+- Custom and jittered retry backoff strategies for BullMQ parity. (#67)
+  - `FixedBackoffWithJitter` / `ExponentialBackoffWithJitter` apply
+    BullMQ's jitter fraction (`0..1`); the value is persisted in the
+    `opts.backoff` wire shape (`{type, delay, jitter}`) so foreign
+    BullMQ workers honour it.
+  - `CustomBackoff()` + `Worker.WithBackoffStrategy` expose BullMQ's
+    `settings.backoffStrategy` path: an arbitrary `func(attemptsMade int)
+    time.Duration` owns the formula, cap, and jitter. This lets mk-go
+    reproduce Misskey's `httpRelatedBackoff` (`(2^n-1)*base`, capped at
+    8h, plus 0-20% jitter) drop-in. (#66)
+
+### Fixed
+
+- (none)
+
 ## [1.0.1] - 2026-04-27
 
 ### Added
