@@ -71,12 +71,14 @@ type RetentionLimit struct {
 	AgeSeconds *int
 }
 
-// Backoff matches BullMQ's BackoffOptions shape ({type, delay}).
+// Backoff matches BullMQ's BackoffOptions shape ({type, delay, jitter}).
 type Backoff struct {
-	// Type is "fixed" or "exponential".
+	// Type is "fixed", "exponential", or "custom".
 	Type string
 	// Delay is the base delay in milliseconds.
 	Delay int64
+	// Jitter is BullMQ's jitter fraction (0..1). 0 omits the field.
+	Jitter float64
 }
 
 // EncodeAddOpts returns the msgpack-encoded ARGV[3] payload.
@@ -95,10 +97,16 @@ func EncodeAddOpts(o AddOpts) ([]byte, error) {
 		m["attempts"] = o.Attempts
 	}
 	if o.Backoff != nil {
-		m["backoff"] = map[string]any{
+		backoff := map[string]any{
 			"type":  o.Backoff.Type,
 			"delay": o.Backoff.Delay,
 		}
+		// jitter は BullMQ でも optional。0 のときは出力しない
+		// ことで、jitter 未使用ジョブの opts JSON を従来どおりに保つ。
+		if o.Backoff.Jitter > 0 {
+			backoff["jitter"] = o.Backoff.Jitter
+		}
+		m["backoff"] = backoff
 	}
 	if o.Lifo {
 		m["lifo"] = true

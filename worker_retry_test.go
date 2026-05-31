@@ -103,6 +103,68 @@ func TestWorker_Retry_ExponentialBackoffSchedules(t *testing.T) {
 	assert.Greater(t, gap2, gap1, "second gap should exceed first")
 }
 
+// TestWorker_Retry_CustomBackoffSchedules verifies the end-to-end wire
+// path for a custom backoff strategy: CustomBackoff() on Add marks the
+// job {"type":"custom"}, WithBackoffStrategy registers the Go-side
+// computation, and the worker honours the returned per-attempt delay
+// when re-enqueuing onto the delayed ZSET. This is the path mk-go uses
+// to reproduce Misskey's httpRelatedBackoff.
+func TestWorker_Retry_CustomBackoffSchedules(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	job, err := queue.Add(ctx, testPayload{},
+		mkq.WithAttempts(3),
+		mkq.WithBackoff(mkq.CustomBackoff()),
+	)
+	require.NoError(t, err)
+
+	var times []int64
+	mu := make(chan struct{}, 1)
+	mu <- struct{}{}
+	// Strategy: attempt 1 -> 40ms, attempt 2 -> 120ms (distinct, growing,
+	// and not matching the built-in exponential doubling so we know the
+	// custom func actually drives the schedule).
+	strategy := func(attemptsMade int) time.Duration {
+		return time.Duration(attemptsMade*attemptsMade) * 40 * time.Millisecond
+	}
+	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		<-mu
+		times = append(times, time.Now().UnixMilli())
+		mu <- struct{}{}
+		return nil, errors.New("nope")
+	}, mkq.WithIdlePollInterval(10*time.Millisecond), mkq.WithBackoffStrategy(strategy))
+	require.NoError(t, err)
+	defer worker.Stop(context.Background())
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+	waitFor(t, ctx, 20*time.Millisecond, func() bool {
+		v, _ := rdb.ZScore(ctx, base+"failed", job.ID).Result()
+		return v > 0
+	})
+
+	require.Len(t, times, 3, "expected 3 attempts")
+	gap1 := times[1] - times[0]
+	gap2 := times[2] - times[1]
+	// 1st retry: strategy(1) = 1*40 = 40ms; 2nd retry: strategy(2) = 4*40 = 160ms.
+	// 寛容な下限 (poll/scheduling 揺らぎを吸収) でassertする。
+	assert.GreaterOrEqual(t, gap1, int64(30), "first retry should wait ~40ms (got %dms)", gap1)
+	assert.GreaterOrEqual(t, gap2, int64(140), "second retry should wait ~160ms (got %dms)", gap2)
+	assert.Greater(t, gap2, gap1, "second gap should exceed first (custom strategy grows)")
+
+	// opts.backoff must persist as the BullMQ custom wire shape so a
+	// foreign worker / dashboard reads {"type":"custom"}.
+	h, err := rdb.HGet(ctx, base+job.ID, "opts").Result()
+	require.NoError(t, err)
+	assert.Contains(t, h, `"type":"custom"`, "opts.backoff must persist type=custom")
+}
+
 // TestWorker_Retry_NoAttemptsDefaultIsOneShot ensures the existing
 // no-WithAttempts behaviour (1 attempt -> failed) is preserved.
 func TestWorker_Retry_NoAttemptsDefaultIsOneShot(t *testing.T) {
