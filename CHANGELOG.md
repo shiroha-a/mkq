@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Public pause/resume API for BullMQ `Queue.pause()` / `Queue.resume()`
+  parity. (#70)
+  - `Queue.Pause` sets the `meta.paused` flag and atomically moves the
+    `wait` list to `paused` (vendored `pause-7.lua`), so jobs already
+    queued are parked rather than dropped. Jobs enqueued while paused
+    also land in `paused` (no orphans); the pause is shared via Redis so
+    every worker process honours it.
+  - `Queue.Resume` clears the flag, returns parked jobs to `wait`, and
+    pokes the marker ZSET so blocking workers wake immediately.
+  - `Queue.IsPaused` reports the current state via `HEXISTS meta paused`.
+
 ## [1.0.2] - 2026-06-01
 
 ### Added

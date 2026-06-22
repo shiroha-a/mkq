@@ -53,6 +53,7 @@ const (
 	Drain                 ScriptName = "drain-5"
 	Promote               ScriptName = "promote-9"
 	ReprocessJob          ScriptName = "reprocessJob-8"
+	Pause                 ScriptName = "pause-7"
 )
 
 // Scripter executes vendored Lua scripts via EVALSHA, with transparent
@@ -101,7 +102,7 @@ func NewScripter(ctx context.Context, client redis.Scripter, logger Logger) (*Sc
 		AddJobScheduler, UpdateJobScheduler,
 		UpdateProgress, UpdateData, AddLog,
 		GetCounts, GetRanges, GetMetrics,
-		RemoveJob, Drain, Promote, ReprocessJob,
+		RemoveJob, Drain, Promote, ReprocessJob, Pause,
 	} {
 		if _, err := s.load(ctx, name); err != nil {
 			return nil, fmt.Errorf("preload %s: %w", name, err)

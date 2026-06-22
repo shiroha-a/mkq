@@ -157,6 +157,10 @@ queue.RetryJob(ctx, jobID)
 queue.PromoteJob(ctx, jobID)
 queue.RemoveJob(ctx, jobID)
 queue.DrainPending(ctx, mkq.WithDrainDelayed(true))
+
+queue.Pause(ctx)             // stop handing jobs to workers (wait -> paused)
+queue.Resume(ctx)            // resume (paused -> wait, wakes blocking workers)
+paused, _ := queue.IsPaused(ctx)
 ```
 
 ### Job mutation from inside a handler
@@ -256,7 +260,8 @@ the asynq → mkq migration walkthrough.
 - **Inspector** (read): `Queue.Counts`, `Queue.ListJobs`,
   `Queue.Get`, `Client.Queues`.
 - **Inspector** (admin): `Queue.RemoveJob`, `Queue.DrainPending`,
-  `Queue.PromoteJob`, `Queue.RetryJob`.
+  `Queue.PromoteJob`, `Queue.RetryJob`, `Queue.Pause`, `Queue.Resume`,
+  `Queue.IsPaused`.
 - **Job mutation from handler**: `Job.UpdateProgress`,
   `Job.UpdateData`, `Job.Log`; out-of-band `Queue.UpdateJobProgress`,
   `Queue.UpdateJobData`, `Queue.AppendJobLog`.
