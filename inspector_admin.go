@@ -274,3 +274,77 @@ func (q *Queue[T]) RetryJob(ctx context.Context, jobID string, opts ...RetryOpti
 		return fmt.Errorf("mkq: reprocessJob returned error code %d", code)
 	}
 }
+
+// Pause stops the queue from handing jobs to workers, mirroring
+// BullMQ's Queue.pause(). It atomically sets the `meta.paused` flag and
+// renames the `wait` list onto `paused`, so any jobs already queued are
+// parked rather than dropped. Jobs enqueued while paused also land in
+// `paused` (addStandardJob honours the flag via getTargetQueueList), so
+// nothing is orphaned; Resume returns the whole set to `wait`.
+//
+// The pause is global to the queue and shared via Redis, so every
+// worker process bound to the same queue honours it (the gate lives in
+// moveToActive's Lua, not in any single client). In-flight jobs already
+// locked by a worker are allowed to finish — Pause only blocks new
+// fetches.
+//
+// Equivalent to BullMQ pause-7.lua with ARGV "paused". Idempotent:
+// pausing an already-paused queue is a no-op at the wire level.
+func (q *Queue[T]) Pause(ctx context.Context) error {
+	return q.pauseResume(ctx, q.keys.Wait(), q.keys.Paused(), "paused")
+}
+
+// Resume re-enables job processing on a paused queue, mirroring
+// BullMQ's Queue.resume(). It clears the `meta.paused` flag, renames the
+// `paused` list back onto `wait`, and pokes the marker ZSET so blocking
+// workers wake immediately instead of waiting out their BRPOPLPUSH
+// timeout.
+//
+// Equivalent to BullMQ pause-7.lua with ARGV "resumed". Idempotent:
+// resuming a queue that is not paused is a no-op at the wire level.
+func (q *Queue[T]) Resume(ctx context.Context) error {
+	return q.pauseResume(ctx, q.keys.Paused(), q.keys.Wait(), "resumed")
+}
+
+// pauseResume runs the vendored pause-7.lua. source/target are the
+// LIST keys to rename (wait->paused for pause, paused->wait for
+// resume); event is the BullMQ stream event ("paused" or "resumed")
+// that also selects the branch inside the Lua.
+func (q *Queue[T]) pauseResume(ctx context.Context, source, target, event string) error {
+	_, err := q.client.scripts.Run(
+		ctx,
+		lua.Pause,
+		// pause-7.lua KEYS:
+		//   1 source list, 2 target list, 3 meta, 4 prioritized,
+		//   5 events, 6 delayed, 7 marker
+		[]string{
+			source,
+			target,
+			q.keys.Meta(),
+			q.keys.Prioritized(),
+			q.keys.Events(),
+			q.keys.Delayed(),
+			q.keys.Marker(),
+		},
+		event,
+	)
+	// pause-7.lua はステータスコードを返さない (末尾は XADD)。返り値の
+	// 無い EVALSHA を go-redis は redis.Nil として surface するので成功
+	// 扱い。実エラー (NOSCRIPT 後の reload 失敗等) はそのまま伝播。
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("mkq: %s: %w", event, err)
+	}
+	return nil
+}
+
+// IsPaused reports whether the queue is currently paused, mirroring
+// BullMQ's Queue.isPaused(). It checks for the `paused` field on the
+// `meta` HASH (HEXISTS) — an empty `paused` list and an unpaused queue
+// are distinct states, so the flag, not the list, is authoritative.
+func (q *Queue[T]) IsPaused(ctx context.Context) (bool, error) {
+	paused, err := q.client.rdb.HExists(ctx, q.keys.Meta(), "paused").Result()
+	if err != nil {
+		return false, fmt.Errorf("mkq: isPaused: %w", err)
+	}
+	return paused, nil
+}
