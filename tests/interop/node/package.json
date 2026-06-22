@@ -15,5 +15,9 @@
     "bullmq": "5.76.2",
     "express": "4.21.2",
     "ioredis": "5.10.1"
+  },
+  "overrides": {
+    "qs": "6.15.2",
+    "path-to-regexp": "0.1.13"
   }
 }
