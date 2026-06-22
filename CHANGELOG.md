@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-06-23
+
 ### Added
 
 - Public pause/resume API for BullMQ `Queue.pause()` / `Queue.resume()`
