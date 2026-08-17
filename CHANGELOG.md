@@ -6,6 +6,39 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-08-18
+
+### Changed
+
+- Minimum Go version raised to 1.26 (matches mk-go's `go.mod`). CI now
+  reads the version from `go.mod` via `setup-go`'s `go-version-file`,
+  so the workflow and the module cannot drift apart.
+- `WithIdlePollInterval` now sets the *floor* of the idle wait rather
+  than a fixed period: an idle dispatcher doubles its wait on every
+  empty poll, capped at 30s, and snaps back to the floor as soon as it
+  processes a job. Job pickup latency is unchanged — the wait ends on
+  the marker push that `addJob` performs — so callers do not need to
+  retune the option. (#74)
+
+### Fixed
+
+- Idle workers no longer poll Redis once per second per dispatcher.
+  go-redis rounds a `BZPOPMIN` timeout up to whole seconds, so every
+  dispatcher woke and issued a `tryOnce` each second even with an empty
+  queue, scaling with worker count. A mk-go production instance was
+  issuing 774 commands/s against an idle queue where the equivalent
+  BullMQ deployment issued 21.5. With the backoff, 8 workers idling for
+  20s drop from 1,284 commands to 388. (#74)
+- `Worker.Stop` is no longer bounded by `idlePollInterval`. Cancelling
+  the context does not abort an in-flight `BZPOPMIN` — go-redis derives
+  the read deadline from the block timeout and does not interrupt a
+  read already issued — so shutdown waited out the remaining interval
+  (7.78s measured at `interval=8s`). `Stop` now pokes the marker key to
+  wake blocked dispatchers, bringing shutdown to single-digit
+  milliseconds regardless of the interval. Each poked member is named
+  per dispatcher: the marker is a sorted set, so repeating one member
+  name collapses to a single entry and wakes only one waiter. (#74)
+
 ## [1.0.3] - 2026-06-23
 
 ### Added
@@ -177,6 +210,9 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.4
+[1.0.3]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.3
+[1.0.2]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.2
 [1.0.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.1
 [1.0.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.0
