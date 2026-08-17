@@ -49,7 +49,7 @@ roadmap.
 go get github.com/shiroha-a/mkq
 ```
 
-Requires Go 1.25+ and Redis 7+ (Redis 6.2+ also works; tested against
+Requires Go 1.26+ and Redis 7+ (Redis 6.2+ also works; tested against
 the official `redis:7-alpine` container).
 
 ## Quickstart
