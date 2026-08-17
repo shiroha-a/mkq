@@ -8,7 +8,7 @@ RSS, and CPU time.
 
 Prerequisites:
 - Redis on `127.0.0.1:6379` (override via `REDIS=host:port`)
-- Go 1.25+ (matches the repo's `go.mod` toolchain directive)
+- Go 1.26+ (matches the repo's `go.mod` toolchain directive)
 - Node.js 22+
 - GNU `time` (Debian/Ubuntu: `apt install time`; macOS: `brew install gnu-time` and the script becomes `gtime`)
 - GNU `xargs` (uses the `-r` "no-run-if-empty" flag to clear Redis prefixes between runs). Default on Linux. macOS users need `brew install findutils` and an alias / `PATH` adjustment so `xargs` resolves to the GNU version.
