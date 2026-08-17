@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-08-18
+
+### Fixed
+
+- The idle backoff added in 1.0.4 was defeated by a single delayed job.
+  When `tryOnce` reported the next delayed job's timestamp, the
+  dispatcher took a precise-sleep path instead of parking on the marker,
+  and that sleep was capped at `idlePollInterval` (100ms by default). So
+  one job scheduled an hour out was enough to keep every dispatcher
+  issuing `moveToActive` ten times a second — `awaitMarker` was never
+  reached, so the wait never grew. With 8 workers, an otherwise idle
+  queue went from 19 commands/s to **549**. Long delays now park on the
+  marker (capped at 30s): a newly enqueued job still wakes the worker
+  immediately via the marker push, so there is nothing to gain from
+  polling. Sub-second delays keep the precise sleep — go-redis rounds a
+  `BZPOPMIN` timeout up to one second, which would overshoot a 50ms
+  retry backoff. (#76)
+
 ## [1.0.4] - 2026-08-18
 
 ### Changed
@@ -210,7 +228,8 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.5...HEAD
+[1.0.5]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.5
 [1.0.4]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.4
 [1.0.3]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.3
 [1.0.2]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.2
