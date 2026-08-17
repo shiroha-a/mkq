@@ -204,6 +204,7 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 func (w *Worker) Stop(ctx context.Context) error {
 	w.stopOnce.Do(func() {
 		w.runCancel()
+		w.wakeMarkerWaiters()
 		go func() {
 			w.run.Wait()
 			close(w.stopDone)
@@ -215,6 +216,62 @@ func (w *Worker) Stop(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// maxIdleWait caps how long an idle dispatcher parks on the marker key.
+//
+// **上限があるのは marker を取り逃したときの保険。** push は Lua 側で行われる
+// ので通常は取りこぼさないが、Redis のフェイルオーバー等で欠けた場合はこの
+// 間隔で気づく。stalled-recovery (既定 30 秒) と同じ桁に置いてある。
+const maxIdleWait = 30 * time.Second
+
+// nextIdleWait doubles the marker wait after an idle wake-up, capped at
+// maxIdleWait. base が上限を超えている場合は base を尊重する (運用者が明示
+// 設定した値を勝手に縮めない)。
+func nextIdleWait(cur, base time.Duration) time.Duration {
+	if base >= maxIdleWait {
+		return base
+	}
+	next := cur * 2
+	if next > maxIdleWait {
+		next = maxIdleWait
+	}
+	return next
+}
+
+// wakeMarkerWaiters nudges the marker key so a dispatcher parked in
+// BZPopMin returns immediately instead of waiting out its timeout.
+//
+// **ctx cancellation does not interrupt an in-flight BZPopMin.** go-redis
+// sets a read deadline from the block timeout and does not abort the
+// pending read when the context is cancelled, so without this nudge Stop
+// takes up to idlePollInterval (measured: 736ms at 1s, 7.78s at 8s).
+//
+// One push wakes one blocked BZPopMin, so push once per dispatcher. The
+// woken dispatcher sees runCtx cancelled and exits without consuming a
+// job. A push that nobody consumes is harmless: the marker is advisory,
+// and the next tryOnce simply finds no work.
+//
+// Best-effort by design — Stop must not fail because Redis is gone. The
+// timeout path still bounds the wait, it is just slower.
+func (w *Worker) wakeMarkerWaiters() {
+	if w.rdb == nil || w.keys.marker == "" {
+		return
+	}
+	n := w.cfg.concurrency
+	if n < 1 {
+		n = 1
+	}
+	// runCtx is already cancelled here, so use a fresh bounded context.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	// **メンバー名を一意にする。** marker は sorted set なので、同じ名前を
+	// 複数回足しても 1 件にまとまり、起こせる dispatcher が 1 つだけになる。
+	members := make([]redis.Z, n)
+	for i := range members {
+		members[i] = redis.Z{Score: 0, Member: "stop:" + strconv.Itoa(i)}
+	}
+	_ = w.rdb.ZAdd(ctx, w.keys.marker, members...).Err()
 }
 
 // prefetchedJob is what moveToFinished's fetchNext branch returns:
@@ -259,6 +316,11 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 		// stalledInterval until stalled-recovery picks it up.
 		w.releasePrefetchedLock(prefetched)
 	}()
+	// アイドルが続くあいだ marker 待ちの上限を伸ばす。**ジョブ取得は遅く
+	// ならない** — 待っているのは marker への push で、ジョブが積まれた時点で
+	// Lua が push するので即座に起きる。伸ばして効くのは「空振りで起きて
+	// tryOnce を撃つ」頻度だけ。
+	idleWait := w.cfg.idlePollInterval
 	for {
 		if w.runCtx.Err() != nil {
 			return
@@ -291,6 +353,8 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 			continue
 		}
 		if processed {
+			// 仕事があったので待ちを最短に戻す。
+			idleWait = w.cfg.idlePollInterval
 			prefetched = gotPrefetched
 			continue
 		}
@@ -326,9 +390,10 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 			continue
 		}
 		// Idle queue: wake on marker push or timeout.
-		if !w.awaitMarker(w.cfg.idlePollInterval) {
+		if !w.awaitMarker(idleWait) {
 			return
 		}
+		idleWait = nextIdleWait(idleWait, w.cfg.idlePollInterval)
 	}
 }
 
@@ -360,9 +425,15 @@ func (w *Worker) sleep(d time.Duration) bool {
 // timeout to at least 1s. Sub-second responsiveness still works in
 // the only case that matters: a real job landing fires a marker
 // push that wakes BZPopMin within ms regardless of the configured
-// ceiling. ctx cancellation is unaffected — go-redis's v9 Cmd.Result
-// returns ctx.Err immediately when the parent context is cancelled,
-// so Worker.Stop's shutdown latency is not bounded by this floor.
+// ceiling.
+//
+// **ctx cancellation does NOT interrupt an in-flight BZPopMin.** go-redis
+// derives the read deadline from the block timeout and does not abort the
+// pending read when the parent context is cancelled, so a cancelled
+// runCtx alone leaves the dispatcher parked until the timeout expires
+// (measured: 736ms at a 1s ceiling, 7.78s at 8s). Worker.Stop therefore
+// nudges the marker key — see wakeMarkerWaiters. An earlier version of
+// this comment claimed the opposite; it was wrong.
 //
 // Any error response (redis.Nil for timeout, context.Canceled for
 // shutdown, transient network glitches) becomes a "wake and retry"
