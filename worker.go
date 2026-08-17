@@ -225,6 +225,14 @@ func (w *Worker) Stop(ctx context.Context) error {
 // 間隔で気づく。stalled-recovery (既定 30 秒) と同じ桁に置いてある。
 const maxIdleWait = 30 * time.Second
 
+// markerWaitFloor is the shortest wait that awaitMarker can actually
+// honour.
+//
+// **go-redis は BZPopMin のタイムアウトを 1 秒へ切り上げる。** これより短く
+// 待ちたい場合 (sub-second の retry backoff 等) は marker 待ちに載せると
+// overshoot するので、precise sleep を使わなければならない。
+const markerWaitFloor = time.Second
+
 // nextIdleWait doubles the marker wait after an idle wake-up, capped at
 // maxIdleWait. base が上限を超えている場合は base を尊重する (運用者が明示
 // 設定した値を勝手に縮めない)。
@@ -368,23 +376,30 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 			continue
 		}
 		if nextDelayedTs > 0 {
-			// 次 delayed job の絶対 ms timestamp が分かるので、precise
-			// sleep でその時刻まで待つ。BZPopMin の 1s floor だと
-			// sub-second delayed (e.g. 50ms exp-backoff retry) で
-			// overshoot する。delay <= 0 はもう due なので即時 retry。
+			// 次 delayed job の絶対 ms timestamp が分かるので、その時刻
+			// まで待つ。delay <= 0 はもう due なので即時 retry。
 			delay := time.Until(time.UnixMilli(nextDelayedTs))
 			if delay <= 0 {
 				continue
 			}
-			// idlePollInterval を上限とし、delay が長くても worker が
-			// 完全 unresponsive にならないようにする。BZPopMin で待つ
-			// のと違い、新しい wait-list job 到着では起きないが、
-			// delay > idlePollInterval なら次 iter で marker 待ちに
-			// 切り替わる (= sparse-arrival ケースでも応答性維持)。
-			if delay > w.cfg.idlePollInterval {
-				delay = w.cfg.idlePollInterval
+			// sub-second (e.g. 50ms の exp-backoff retry) は marker 待ちに
+			// 載せられない。BZPopMin の 1 秒床で overshoot するため。
+			if delay < markerWaitFloor {
+				if !w.sleep(delay) {
+					return
+				}
+				continue
 			}
-			if !w.sleep(delay) {
+			// **長い delay は marker 待ちで潰す。** 以前はここを
+			// idlePollInterval (既定 100ms) で刻んでいたが、そうすると
+			// 1 時間後の delayed job が 1 件あるだけで dispatcher が
+			// 毎秒 10 回 tryOnce を撃ち続ける (worker 8 個で毎秒 549
+			// コマンド。空のキューなら 19)。marker 待ちなら新しい
+			// wait-list job は push で即座に起こせるので、刻む理由が無い。
+			if delay > maxIdleWait {
+				delay = maxIdleWait
+			}
+			if !w.awaitMarker(delay) {
 				return
 			}
 			continue
