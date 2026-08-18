@@ -6,6 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-08-18
+
+### Fixed
+
+- `Worker.Stop` could block forever when another worker was still
+  running on the same queue. Stop wakes parked dispatchers by pushing to
+  a Redis key, but it pushed to the queue-level `marker` — which every
+  worker on that queue blocks on — so a surviving worker's dispatcher
+  could consume the wake-up meant for the stopping one. A mk-go
+  production instance failed to boot because of this: its autoscaler
+  resized `inbox` from 16 workers down to 4, `Worker.Stop` never
+  returned (the caller passed `context.Background()`), and the HTTP
+  listener was never reached. Each Worker now owns a private wake ZSET
+  and blocks on it alongside the shared marker, so a push always reaches
+  the intended worker. The key is named with a uuid (`workerName` is
+  caller-supplied and can collide) and is deleted once every dispatcher
+  has exited. Measured: 32s (hitting a 20s context deadline) before,
+  4ms after. (#78)
+  - This is not a 1.0.5 regression — pushing to the shared marker dates
+    from 1.0.4. It stayed hidden because dispatchers holding a delayed
+    job sat in a precise sleep rather than on the marker; 1.0.5 moved
+    them onto the marker and exposed it.
+
 ## [1.0.5] - 2026-08-18
 
 ### Fixed
@@ -228,7 +251,8 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.5...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.6...HEAD
+[1.0.6]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.6
 [1.0.5]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.5
 [1.0.4]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.4
 [1.0.3]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.3
