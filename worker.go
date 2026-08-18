@@ -51,11 +51,23 @@ type Worker struct {
 	cfg       workerConfig
 	keys      queueKeys
 	queueName string
-	scripts   *lua.Scripter
-	rdb       redis.UniversalClient
-	logger    Logger
-	metrics   Metrics
-	tracer    Tracer
+
+	// wakeKey is this Worker instance's private ZSET for shutdown
+	// wake-ups. Dispatchers block on it alongside the shared marker.
+	//
+	// **共有 marker では特定の worker を起こせない。** marker はキュー単位で
+	// 同じキューの全 worker が読むので、Stop が push した分を生き残る worker の
+	// dispatcher が横取りしうる。実際に Resize で 16 → 4 に縮めたとき、止めたい
+	// worker の dispatcher が起きずに Stop が返らなくなった。
+	//
+	// 名前は Worker インスタンスごとに一意 (uuid)。cfg.workerName は呼び出し側が
+	// 指定できるので、同名の Worker を複数作られると衝突する。
+	wakeKey string
+	scripts *lua.Scripter
+	rdb     redis.UniversalClient
+	logger  Logger
+	metrics Metrics
+	tracer  Tracer
 
 	// backoffStrategy is the BullMQ settings.backoffStrategy analogue:
 	// invoked for jobs whose backoff Type is not a built-in (fixed /
@@ -134,9 +146,11 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	qk := newQueueKeys(q)
 	w := &Worker{
 		cfg:             cfg,
-		keys:            newQueueKeys(q),
+		keys:            qk,
+		wakeKey:         qk.builder.Base() + "mkq:wake:" + uuid.NewString(),
 		queueName:       q.name,
 		scripts:         q.client.scripts,
 		rdb:             q.client.rdb,
@@ -204,9 +218,10 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 func (w *Worker) Stop(ctx context.Context) error {
 	w.stopOnce.Do(func() {
 		w.runCancel()
-		w.wakeMarkerWaiters()
+		w.wakeDispatchers()
 		go func() {
 			w.run.Wait()
+			w.dropWakeKey()
 			close(w.stopDone)
 		}()
 	})
@@ -247,23 +262,32 @@ func nextIdleWait(cur, base time.Duration) time.Duration {
 	return next
 }
 
-// wakeMarkerWaiters nudges the marker key so a dispatcher parked in
-// BZPopMin returns immediately instead of waiting out its timeout.
+// wakeDispatchers pushes to this Worker's private wake key so every
+// dispatcher parked in BZPopMin returns immediately instead of waiting
+// out its timeout.
 //
 // **ctx cancellation does not interrupt an in-flight BZPopMin.** go-redis
 // sets a read deadline from the block timeout and does not abort the
 // pending read when the context is cancelled, so without this nudge Stop
-// takes up to idlePollInterval (measured: 736ms at 1s, 7.78s at 8s).
+// takes up to the dispatcher's current wait (measured: 736ms at 1s,
+// 7.78s at 8s, up to maxIdleWait once the idle backoff has grown).
 //
-// One push wakes one blocked BZPopMin, so push once per dispatcher. The
-// woken dispatcher sees runCtx cancelled and exits without consuming a
-// job. A push that nobody consumes is harmless: the marker is advisory,
-// and the next tryOnce simply finds no work.
+// **共有 marker には押さない。** marker はキュー単位なので、同じキューで
+// 動き続ける別 worker の dispatcher が起き上がって push を消費してしまう。
+// 実際に Resize で inbox を 16 → 4 に縮めたとき、止めたい worker の
+// dispatcher が起きず Stop が返らなくなり、起動が完了しなくなった。
+// wakeKey はこの Worker インスタンス専用なので横取りされない。
+//
+// One push wakes one blocked BZPopMin, so push once per dispatcher.
+// メンバー名は一意にする (sorted set なので同名は 1 件にまとまり、
+// 起こせる dispatcher が 1 つだけになる)。ジョブ実行中などで
+// BZPopMin にいない dispatcher の分は余るが、key ごと後で消すので
+// 残らない。
 //
 // Best-effort by design — Stop must not fail because Redis is gone. The
 // timeout path still bounds the wait, it is just slower.
-func (w *Worker) wakeMarkerWaiters() {
-	if w.rdb == nil || w.keys.marker == "" {
+func (w *Worker) wakeDispatchers() {
+	if w.rdb == nil || w.wakeKey == "" {
 		return
 	}
 	n := w.cfg.concurrency
@@ -273,13 +297,23 @@ func (w *Worker) wakeMarkerWaiters() {
 	// runCtx is already cancelled here, so use a fresh bounded context.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	// **メンバー名を一意にする。** marker は sorted set なので、同じ名前を
-	// 複数回足しても 1 件にまとまり、起こせる dispatcher が 1 つだけになる。
 	members := make([]redis.Z, n)
 	for i := range members {
 		members[i] = redis.Z{Score: 0, Member: "stop:" + strconv.Itoa(i)}
 	}
-	_ = w.rdb.ZAdd(ctx, w.keys.marker, members...).Err()
+	_ = w.rdb.ZAdd(ctx, w.wakeKey, members...).Err()
+}
+
+// dropWakeKey removes this Worker's private wake key once every
+// dispatcher has exited. 起こしきれずに余ったメンバーが残るので、
+// Worker が消えたあとに孤児の key を置き去りにしない。
+func (w *Worker) dropWakeKey() {
+	if w.rdb == nil || w.wakeKey == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = w.rdb.Del(ctx, w.wakeKey).Err()
 }
 
 // prefetchedJob is what moveToFinished's fetchNext branch returns:
@@ -469,7 +503,11 @@ func (w *Worker) awaitMarker(timeout time.Duration) bool {
 	if timeout < time.Second {
 		timeout = time.Second
 	}
-	_ = w.rdb.BZPopMin(w.runCtx, timeout, w.keys.marker).Err()
+	// **専用 wake key も一緒に待つ。** marker はキュー共有なので、Stop の
+	// 起こしを同じキューの別 worker に横取りされる。wakeKey はこの Worker
+	// インスタンス専用なので、押した分だけ確実にこの worker が起きる。
+	// marker を先に置くのは、仕事がある場合をそちらで拾わせるため。
+	_ = w.rdb.BZPopMin(w.runCtx, timeout, w.keys.marker, w.wakeKey).Err()
 	return w.runCtx.Err() == nil
 }
 
