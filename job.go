@@ -83,4 +83,15 @@ type JobState struct {
 	// Progress is the BullMQ `progress` HASH field (raw JSON, can be
 	// any value — number, string, object).
 	Progress json.RawMessage
+	// Opts is the BullMQ `opts` HASH field verbatim (raw JSON). It is
+	// what BullMQ's TS client exposes as `Job.opts`: attempts, backoff,
+	// removeOnComplete / removeOnFail, priority and so on.
+	//
+	// **加工せずそのまま返す。** admin UI はこれを丸ごと表示する用途で読む
+	// ので、mkq が知っている key だけを組み立て直すと、知らない key が
+	// 黙って消える。Add した側が渡した内容と 1 対 1 で見えることに意味がある。
+	Opts json.RawMessage
+	// Delay is the BullMQ `delay` HASH field in milliseconds. Zero for
+	// jobs added without a delay.
+	Delay int64
 }
