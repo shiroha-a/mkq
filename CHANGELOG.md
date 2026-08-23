@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `stacktrace` is now appended to on each failure instead of being
+  overwritten with a single-element array. BullMQ TS accumulates one entry
+  per attempt — that is why its consumers reverse the array to show the
+  newest first. Overwriting meant **a retried job lost every earlier
+  failure reason**, leaving only the last one.
+
+### Added
+
+- `JobState.AttemptsAt` records the start time of every failed attempt
+  (unix milliseconds, oldest first), stored in the `mkqAttemptsAt` HASH
+  field. **BullMQ has no equivalent** — it keeps no per-attempt timestamp,
+  which is why admin UIs that try to plot retries have nothing to place
+  them at. Unknown HASH fields are ignored by BullMQ and bull-board, so
+  wire compatibility is preserved. Jobs that failed before this release do
+  not have it and cannot be backfilled.
+
 ## [1.0.7] - 2026-08-24
 
 ### Added
