@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-08-24
+
 ### Added
 
 - `JobState` now carries `Opts` (the BullMQ `opts` HASH field verbatim,
