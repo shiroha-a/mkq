@@ -94,4 +94,14 @@ type JobState struct {
 	// Delay is the BullMQ `delay` HASH field in milliseconds. Zero for
 	// jobs added without a delay.
 	Delay int64
+	// AttemptsAt holds the start time of every failed attempt, oldest
+	// first, in unix milliseconds.
+	//
+	// **BullMQ には対応物が無い。** BullMQ TS も試行ごとの時刻を残さないので、
+	// 再試行を時系列に並べたい admin UI は置く時刻を持てない (upstream Misskey の
+	// job 詳細が試行を `at ?` と表示しているのはこれが理由)。mkq の拡張として
+	// 記録する。未知 field は BullMQ / bull-board が無視するので wire 互換は保たれる。
+	//
+	// **この拡張が入る前に失敗した job には無い。** 遡って埋めることはできない。
+	AttemptsAt []int64
 }

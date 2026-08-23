@@ -635,7 +635,8 @@ func (w *Worker) runJob(handlerAny any, token, jobID string, jobMap map[string]s
 
 	if defa, hasDefa := jobMap["defa"]; hasDefa && defa != "" {
 		jobOpts := parseJobOpts(jobMap["opts"])
-		prefetched, err := w.finishFailed(jobID, token, jobOpts, defa, mustJSONString([]string{defa}))
+		// stalled 上限超過も 1 回の失敗として履歴に積む。
+		prefetched, err := w.finishFailed(jobID, token, jobOpts, defa, buildFailureHistory(jobMap, defa))
 		if err != nil {
 			// Best-effort lock cleanup matches the processJob path.
 			_, _ = w.scripts.Run(
@@ -1032,8 +1033,11 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 	// the retry decision robust if BullMQ semantics shift later.
 	atm := w.fetchAtm(jobID, jobMap)
 
+	// 失敗のたびに stacktrace を積み、その試行の開始時刻を残す。
+	hist := buildFailureHistory(jobMap, out.errReason)
+
 	if !w.shouldRetry(jobOpts, atm, out.err) {
-		pf, err := w.finishFailed(jobID, token, jobOpts, out.errReason, out.stacktrace)
+		pf, err := w.finishFailed(jobID, token, jobOpts, out.errReason, hist)
 		if err != nil {
 			return pf, finaliseStatusError, err
 		}
@@ -1042,12 +1046,12 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 
 	delay := w.computeRetryDelay(jobOpts.backoff, atm+1)
 	if delay > 0 {
-		if err := w.retryDelayed(jobID, token, delay, out.errReason, out.stacktrace); err != nil {
+		if err := w.retryDelayed(jobID, token, delay, out.errReason, hist); err != nil {
 			return nil, finaliseStatusError, err
 		}
 		return nil, finaliseStatusRetrying, nil
 	}
-	if err := w.retryImmediate(jobID, token, jobOpts.lifo, out.errReason, out.stacktrace); err != nil {
+	if err := w.retryImmediate(jobID, token, jobOpts.lifo, out.errReason, hist); err != nil {
 		return nil, finaliseStatusError, err
 	}
 	return nil, finaliseStatusRetrying, nil
@@ -1066,10 +1070,10 @@ func (w *Worker) finishCompleted(jobID, token string, opts jobOpts, returnValue 
 // vendored Lua only emits `retries-exhausted` when retries are
 // genuinely exhausted; jobOpts.removeOnFail drives failed ZSET
 // retention.
-func (w *Worker) finishFailed(jobID, token string, opts jobOpts, reason, stacktrace string) (*prefetchedJob, error) {
+func (w *Worker) finishFailed(jobID, token string, opts jobOpts, reason string, hist failureHistory) (*prefetchedJob, error) {
 	return w.runMoveToFinished(jobID, token, opts.attempts, opts.removeOnFail,
 		"failed", "failedReason", reason,
-		[]any{"stacktrace", stacktrace})
+		[]any{"stacktrace", hist.stacktrace, attemptHistoryField, hist.attemptsAt})
 }
 
 // runMoveToFinished is the shared moveToFinished invocation. extraFields
@@ -1218,14 +1222,15 @@ func (w *Worker) releasePrefetchedLock(pj *prefetchedJob) {
 // retryImmediate re-enqueues a failed job via retryJob-11.lua. The Lua
 // bumps `atm` (HINCRBY) atomically and writes failedReason/stacktrace
 // via ARGV[6] (jobFieldsToUpdate, msgpack flat array).
-func (w *Worker) retryImmediate(jobID, token string, lifo bool, reason, stacktrace string) error {
+func (w *Worker) retryImmediate(jobID, token string, lifo bool, reason string, hist failureHistory) error {
 	now := time.Now().UnixMilli()
 	pushCmd := "LPUSH"
 	if lifo {
 		pushCmd = "RPUSH"
 	}
 
-	jobFields, err := proto.EncodeJobFields("failedReason", reason, "stacktrace", stacktrace)
+	jobFields, err := proto.EncodeJobFields("failedReason", reason,
+		"stacktrace", hist.stacktrace, attemptHistoryField, hist.attemptsAt)
 	if err != nil {
 		return fmt.Errorf("encode retry job fields: %w", err)
 	}
@@ -1253,14 +1258,15 @@ func (w *Worker) retryImmediate(jobID, token string, lifo bool, reason, stacktra
 
 // retryDelayed re-enqueues with a delay via moveToDelayed-12.lua,
 // honouring exponential / fixed backoff computed Go-side.
-func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason, stacktrace string) error {
+func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason string, hist failureHistory) error {
 	now := time.Now().UnixMilli()
 	// 防御: computeBackoffDelay は >0 のはずだが、誤って 0 を渡すと
 	// Lua が delayedTimestamp = timestamp + 0 で即時 promote 候補に
 	// なる。1 ms 床値で「delayed」状態を確実にする。
 	delayMs := max(delay.Milliseconds(), 1)
 
-	jobFields, err := proto.EncodeJobFields("failedReason", reason, "stacktrace", stacktrace)
+	jobFields, err := proto.EncodeJobFields("failedReason", reason,
+		"stacktrace", hist.stacktrace, attemptHistoryField, hist.attemptsAt)
 	if err != nil {
 		return fmt.Errorf("encode retry job fields: %w", err)
 	}
@@ -1731,4 +1737,69 @@ func (k queueKeys) moveToDelayedKeys(jobID string) []string {
 		k.events, k.meta, k.stalled, k.wait, k.limiter,
 		k.paused, k.pc,
 	}
+}
+
+// attemptHistoryField is the HASH field holding the start time (unix
+// milliseconds) of every failed attempt, as a JSON array of numbers.
+//
+// **BullMQ には対応物が無い。** BullMQ TS も試行ごとの時刻を残さないので、
+// admin UI は再試行を並べようとしても置く時刻が無い (upstream Misskey の
+// job 詳細が試行を `at ?` と表示しているのはこれが理由)。mkq の拡張として
+// 記録する。未知 field は BullMQ / bull-board が無視するので wire 互換は保たれる。
+const attemptHistoryField = "mkqAttemptsAt"
+
+// failureHistory accumulates the per-failure fields that BullMQ keeps as
+// arrays. jobMap is the moveToActive snapshot, so the previous values are
+// already in hand and no extra round trip is needed.
+type failureHistory struct {
+	stacktrace string // JSON array of strings
+	attemptsAt string // JSON array of unix-ms numbers
+}
+
+// buildFailureHistory appends this failure to whatever the job already
+// carried.
+//
+// **上書きせず積む。** BullMQ TS は stacktrace を試行ごとに append する。
+// mkq は 1 要素で上書きしていたので、**再試行した job の過去の失敗理由が
+// 残らなかった**。積む側に揃える。
+//
+// attemptsAt にはその試行の開始時刻 (processedOn) を積む。失敗時刻ではなく
+// 開始時刻なのは、admin UI が「何回目がいつ走ったか」を並べるため。
+func buildFailureHistory(jobMap map[string]string, reason string) failureHistory {
+	traces := decodeJSONStrings(jobMap["stacktrace"])
+	traces = append(traces, reason)
+
+	starts := decodeJSONInt64s(jobMap[attemptHistoryField])
+	if v, err := strconv.ParseInt(jobMap["processedOn"], 10, 64); err == nil && v > 0 {
+		starts = append(starts, v)
+	}
+	return failureHistory{
+		stacktrace: mustJSONString(traces),
+		attemptsAt: mustJSONString(starts),
+	}
+}
+
+// decodeJSONStrings best-effort decodes a JSON string array. 壊れていたら
+// 捨てる — 記録の継続より、今回の失敗を残すことを優先する。
+func decodeJSONStrings(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// decodeJSONInt64s best-effort decodes a JSON number array.
+func decodeJSONInt64s(raw string) []int64 {
+	if raw == "" {
+		return nil
+	}
+	var out []int64
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
 }
