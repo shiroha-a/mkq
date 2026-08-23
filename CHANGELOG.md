@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-08-24
+
 ### Fixed
 
 - `stacktrace` is now appended to on each failure instead of being
