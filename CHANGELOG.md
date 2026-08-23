@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `JobState` now carries `Opts` (the BullMQ `opts` HASH field verbatim,
+  as raw JSON) and `Delay` (milliseconds). `Queue.Get` already read the
+  whole HASH and threw both away, so surfacing them costs no extra round
+  trip. Admin UIs need `opts` to show a job's real `attempts` / `backoff`
+  / `removeOnComplete` — reconstructing it from the fields mkq happens to
+  know silently drops any key mkq does not model. `ListJobs` returns the
+  same values.
+- `Queue.GetJobLogs(ctx, jobID, start, end)` reads the log lines written
+  by `Job.Log` / `Queue.AppendJobLog`, returning `JobLogs{Logs, Count}`.
+  The write side existed since job mutations landed but there was no way
+  to read them back, so an admin log tab had nothing to show. Mirrors
+  BullMQ's `Queue.getJobLogs`: `count` is the full list length even when
+  a sub-range is requested, and a missing job is indistinguishable from a
+  job with no logs (both empty).
+
 ## [1.0.6] - 2026-08-18
 
 ### Fixed

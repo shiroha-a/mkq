@@ -3,7 +3,10 @@ package mkq
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/shiroha-a/mkq/internal/lua"
 )
@@ -146,4 +149,47 @@ func classifyMutationResult(res any) error {
 		return fmt.Errorf("mkq: mutation lua returned error code %d", code)
 	}
 	return nil
+}
+
+// JobLogs is the result of Queue.GetJobLogs: the requested slice of a
+// job's log list plus the total length of that list.
+//
+// BullMQ's Queue.getJobLogs returns the same pair ({logs, count}) so a
+// paging admin UI can show "showing N of M" without a second call.
+type JobLogs struct {
+	Logs  []string
+	Count int64
+}
+
+// GetJobLogs returns the log lines appended to jobID via Job.Log /
+// AppendJobLog, between the zero-based inclusive range [start, end].
+// Pass (0, -1) for the whole list, mirroring LRANGE and BullMQ's
+// Queue.getJobLogs defaults.
+//
+// **存在しない job と log が 1 行も無い job を区別しない。** BullMQ の
+// getJobLogs も `<job>:logs` を読むだけで job HASH の存在は見ないので、
+// どちらも空の結果になる。呼び出し側が区別したいなら Get を併用すること。
+func (q *Queue[T]) GetJobLogs(ctx context.Context, jobID string, start, end int64) (JobLogs, error) {
+	if jobID == "" {
+		return JobLogs{}, fmt.Errorf("mkq: jobID must be non-empty")
+	}
+	key := q.keys.JobLogs(jobID)
+	pipe := q.client.rdb.Pipeline()
+	lrange := pipe.LRange(ctx, key, start, end)
+	llen := pipe.LLen(ctx, key)
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return JobLogs{}, fmt.Errorf("mkq: getJobLogs %s: %w", jobID, err)
+	}
+	logs, err := lrange.Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return JobLogs{}, fmt.Errorf("mkq: getJobLogs %s: %w", jobID, err)
+	}
+	count, err := llen.Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return JobLogs{}, fmt.Errorf("mkq: getJobLogs %s: %w", jobID, err)
+	}
+	if logs == nil {
+		logs = []string{}
+	}
+	return JobLogs{Logs: logs, Count: count}, nil
 }
