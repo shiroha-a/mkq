@@ -6,6 +6,49 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `WithBackoffStrategyFunc` registers a custom backoff that receives the
+  job context — id, name, attempt count, the error the handler returned,
+  and the backoff type — instead of only the attempt count.
+
+  This closes a parity gap rather than adding a mkq-ism: BullMQ's own
+  `settings.backoffStrategy` is called with
+  `(attemptsMade, type, err, job)` (see
+  `third_party/bullmq/src/types/backoff-strategy.ts`), while mkq's
+  `CustomBackoffFunc` dropped the last three. **Without the error there
+  is no way to honour an HTTP 429's `Retry-After`**, or to back off
+  differently depending on why the attempt failed.
+
+  `WithBackoffStrategy` keeps working unchanged. Registering both logs a
+  warning at `Process` time and uses the context-aware one, since it can
+  express everything the other can.
+
+### Changed
+
+- A custom backoff strategy that returns a **negative** duration now
+  stops the retries and fails the job, matching BullMQ, whose
+  `settings.backoffStrategy` uses `-1` for exactly that
+  (`third_party/bullmq/src/classes/job.ts`: `delay == -1 ? false : true`).
+  Previously any non-positive return fell through to an immediate retry,
+  so a strategy ported from TypeScript had its "give up" inverted into
+  "resend now" and burned the remaining attempts back to back.
+
+  This affects `WithBackoffStrategy` as well as the new option. A
+  strategy that returned a negative duration meaning "retry immediately"
+  should return 0 instead.
+
+### Fixed
+
+- A panic inside a registered backoff strategy no longer takes the
+  worker process down. It runs after `runHandler`'s recover has
+  returned and the dispatch loop has none of its own, so the goroutine
+  unwound and the job it held stayed locked in `active` until stalled
+  recovery. The panic is now logged and the job retried immediately.
+
+  No Redis wire format change: the delay still reaches Lua as a plain
+  integer.
+
 ## [1.0.8] - 2026-08-24
 
 ### Fixed

@@ -1,6 +1,8 @@
 package mkq
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -126,11 +128,11 @@ func TestComputeRetryDelay_BuiltinNoJitter(t *testing.T) {
 	// rng must not be consulted when Jitter == 0.
 	w := &Worker{rng: func() float64 { t.Fatal("rng called without jitter"); return 0 }}
 	fixed := FixedBackoff(150 * time.Millisecond)
-	if got := w.computeRetryDelay(&fixed, 5); got != 150*time.Millisecond {
+	if got := w.computeRetryDelay(&fixed, BackoffContext{AttemptsMade: 5}); got != 150*time.Millisecond {
 		t.Errorf("fixed: got %v", got)
 	}
 	exp := ExponentialBackoff(20 * time.Millisecond)
-	if got := w.computeRetryDelay(&exp, 3); got != 80*time.Millisecond {
+	if got := w.computeRetryDelay(&exp, BackoffContext{AttemptsMade: 3}); got != 80*time.Millisecond {
 		t.Errorf("exp attempt=3: got %v want 80ms", got)
 	}
 }
@@ -141,7 +143,7 @@ func TestComputeRetryDelay_BuiltinJitter(t *testing.T) {
 	exp := ExponentialBackoffWithJitter(100*time.Millisecond, 0.2)
 	// attempt 3: base = 100ms * 2^2 = 400ms.
 	// jitter: 0.5*400*0.2 + 400*0.8 = 40 + 320 = 360ms.
-	if got := w.computeRetryDelay(&exp, 3); got != 360*time.Millisecond {
+	if got := w.computeRetryDelay(&exp, BackoffContext{AttemptsMade: 3}); got != 360*time.Millisecond {
 		t.Errorf("exp+jitter: got %v want 360ms", got)
 	}
 }
@@ -152,19 +154,19 @@ func TestComputeRetryDelay_Custom(t *testing.T) {
 		return time.Duration(attemptsMade) * time.Second
 	}}
 	b := CustomBackoff()
-	if got := w.computeRetryDelay(&b, 4); got != 4*time.Second {
+	if got := w.computeRetryDelay(&b, BackoffContext{AttemptsMade: 4}); got != 4*time.Second {
 		t.Errorf("custom: got %v want 4s", got)
 	}
 
 	// Unregistered custom strategy falls back to immediate retry.
 	w2 := &Worker{}
-	if got := w2.computeRetryDelay(&b, 4); got != 0 {
+	if got := w2.computeRetryDelay(&b, BackoffContext{AttemptsMade: 4}); got != 0 {
 		t.Errorf("unregistered custom: got %v want 0", got)
 	}
 
 	// Unknown (non-built-in) type with no strategy also returns 0.
 	unknown := BackoffStrategy{Type: "polynomial", Delay: time.Second}
-	if got := w2.computeRetryDelay(&unknown, 3); got != 0 {
+	if got := w2.computeRetryDelay(&unknown, BackoffContext{AttemptsMade: 3}); got != 0 {
 		t.Errorf("unknown type: got %v want 0", got)
 	}
 }
@@ -172,11 +174,11 @@ func TestComputeRetryDelay_Custom(t *testing.T) {
 func TestComputeRetryDelay_NilAndZeroAttempts(t *testing.T) {
 	t.Parallel()
 	w := &Worker{}
-	if got := w.computeRetryDelay(nil, 3); got != 0 {
+	if got := w.computeRetryDelay(nil, BackoffContext{AttemptsMade: 3}); got != 0 {
 		t.Errorf("nil strategy: got %v", got)
 	}
 	b := ExponentialBackoff(time.Second)
-	if got := w.computeRetryDelay(&b, 0); got != 0 {
+	if got := w.computeRetryDelay(&b, BackoffContext{AttemptsMade: 0}); got != 0 {
 		t.Errorf("attempt=0: got %v", got)
 	}
 }
@@ -208,8 +210,99 @@ func TestComputeRetryDelay_MisskeyHttpRelatedBackoff(t *testing.T) {
 		{20, 8 * time.Hour},  // well past the cap
 	}
 	for _, c := range cases {
-		if got := w.computeRetryDelay(&b, c.attempt); got != c.want {
+		if got := w.computeRetryDelay(&b, BackoffContext{AttemptsMade: c.attempt}); got != c.want {
 			t.Errorf("attempt=%d: got %v want %v", c.attempt, got, c.want)
 		}
+	}
+}
+
+// TestComputeRetryDelay_ContextFunc verifies the context-aware strategy
+// receives everything BullMQ's settings.backoffStrategy is called with,
+// and that the backoff type is filled in from the job's own opts rather
+// than having to be passed by the caller.
+func TestComputeRetryDelay_ContextFunc(t *testing.T) {
+	t.Parallel()
+	var seen BackoffContext
+	w := &Worker{backoffFunc: func(bc BackoffContext) time.Duration {
+		seen = bc
+		return 7 * time.Second
+	}}
+
+	sentinel := errors.New("handler blew up")
+	b := CustomBackoff()
+	got := w.computeRetryDelay(&b, BackoffContext{
+		JobID:        "42",
+		Name:         "deliver",
+		AttemptsMade: 3,
+		Err:          sentinel,
+	})
+
+	if got != 7*time.Second {
+		t.Errorf("delay: got %v want 7s", got)
+	}
+	if seen.JobID != "42" || seen.Name != "deliver" || seen.AttemptsMade != 3 {
+		t.Errorf("context: got %+v", seen)
+	}
+	if !errors.Is(seen.Err, sentinel) {
+		t.Errorf("err: got %v want %v", seen.Err, sentinel)
+	}
+	if seen.BackoffType != "custom" {
+		t.Errorf("backoff type: got %q want %q", seen.BackoffType, "custom")
+	}
+}
+
+// The error is the whole point of the context form: a strategy has to be
+// able to pull a retry hint out of a typed error.
+func TestComputeRetryDelay_ContextFuncSeesATypedError(t *testing.T) {
+	t.Parallel()
+	w := &Worker{backoffFunc: func(bc BackoffContext) time.Duration {
+		var rl *rateLimitedError
+		if errors.As(bc.Err, &rl) {
+			return rl.retryAfter
+		}
+		return time.Minute
+	}}
+	b := CustomBackoff()
+
+	limited := fmt.Errorf("deliver: %w", &rateLimitedError{retryAfter: 30 * time.Second})
+	if got := w.computeRetryDelay(&b, BackoffContext{AttemptsMade: 1, Err: limited}); got != 30*time.Second {
+		t.Errorf("rate-limited: got %v want 30s", got)
+	}
+	if got := w.computeRetryDelay(&b, BackoffContext{AttemptsMade: 1, Err: errors.New("other")}); got != time.Minute {
+		t.Errorf("other error: got %v want 1m", got)
+	}
+}
+
+type rateLimitedError struct{ retryAfter time.Duration }
+
+func (e *rateLimitedError) Error() string { return "rate limited" }
+
+// Registering both forms is a configuration mistake rather than a
+// meaningful combination; the context form wins because it can express
+// everything the other one can.
+func TestComputeRetryDelay_ContextFuncWinsOverAttemptOnly(t *testing.T) {
+	t.Parallel()
+	w := &Worker{
+		backoffFunc:     func(BackoffContext) time.Duration { return time.Second },
+		backoffStrategy: func(int) time.Duration { return time.Hour },
+	}
+	b := CustomBackoff()
+	if got := w.computeRetryDelay(&b, BackoffContext{AttemptsMade: 1}); got != time.Second {
+		t.Errorf("got %v want 1s (the context-aware strategy)", got)
+	}
+}
+
+// Built-in types stay wire-faithful: a registered custom strategy must
+// not hijack fixed / exponential jobs.
+func TestComputeRetryDelay_ContextFuncIgnoredForBuiltins(t *testing.T) {
+	t.Parallel()
+	w := &Worker{backoffFunc: func(BackoffContext) time.Duration { return time.Hour }}
+	fixed := FixedBackoff(150 * time.Millisecond)
+	if got := w.computeRetryDelay(&fixed, BackoffContext{AttemptsMade: 5}); got != 150*time.Millisecond {
+		t.Errorf("fixed: got %v want 150ms", got)
+	}
+	exp := ExponentialBackoff(20 * time.Millisecond)
+	if got := w.computeRetryDelay(&exp, BackoffContext{AttemptsMade: 3}); got != 80*time.Millisecond {
+		t.Errorf("exponential: got %v want 80ms", got)
 	}
 }

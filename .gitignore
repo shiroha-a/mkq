@@ -34,6 +34,9 @@ go.work.sum
 # Local design / task scratch (per CLAUDE.md workflow)
 .tmp/
 
+# Coding-agent local index (regenerated, machine-specific)
+.serena/
+
 # Node deps for interop harness (regenerated from package-lock.json)
 tests/interop/node/node_modules/
 
