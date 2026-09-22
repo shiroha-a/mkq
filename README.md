@@ -251,6 +251,9 @@ the asynq → mkq migration walkthrough.
 - **Job options**: WithDelay, WithPriority, WithLifo,
   WithKeepCompleted/Failed (count + age), WithDeduplication / WithUnique,
   WithJobName, WithJobID.
+- **Shutdown**: `Worker.Stop` (cancel in-flight, then await) and
+  `Worker.Drain` (take no new work, let in-flight finish), both bounded
+  by the caller's context.
 - **Worker options**: WithConcurrency, WithLockDuration,
   WithStalledInterval, WithMaxStalledCount, WithIdlePollInterval,
   WithRateLimit, WithWorkerName, WithBackoffStrategy /
