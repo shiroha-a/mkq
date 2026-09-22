@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- Cleared the open Dependabot alerts.
+
+  `go.opentelemetry.io/otel/sdk` 1.43.0 -> 1.46.0 (GHSA-8wmf-6v46-5gfg).
+  The otel family moves together, so `otel` and `otel/trace` go to 1.46.0
+  as well. It is a test-only import (`observability/oteladapter`'s tests),
+  but it sits in `go.mod` all the same.
+
+  In the interop harness, `express` 4.21.2 -> 4.22.3, which brings
+  `qs` 6.16.0 (GHSA-4mjr-xmp4-gh2g, GHSA-x5fp-wj9c-mxmx) and
+  `body-parser` 1.20.8 (GHSA-v422-hmwv-36x6); `brace-expansion` moves to
+  2.1.7 (GHSA-rgw5-rvv9-x895, GHSA-3jxr-9vmj-r5cp, GHSA-mh99-v99m-4gvg).
+  The `qs` override that pinned 6.15.2 is gone — express now resolves a
+  fixed version on its own, and the pin only held it back.
+
+  The harness is test-only and ships in no binary, but it runs in CI and
+  a bull-board smoke test depends on express, so the interop suite was
+  run locally against the bump before it landed.
+
 ### Added
 
 - `Worker.Drain(ctx)` stops dequeueing and waits for the handlers that
