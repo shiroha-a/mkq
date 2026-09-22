@@ -30,6 +30,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
   after the cancellation, and a closed client turns the drain back into
   the redelivery it was meant to avoid.
 
+- `Client.DiscoverQueues` enumerates the queues actually present in
+  Redis under the client's key prefix, including ones mkq never
+  `Define`'d — a queue created by a BullMQ worker in another language,
+  or by another process. `Queues` answers "what does this process work
+  on"; this answers "what is in this deployment", which is what a
+  dashboard or an admin CLI needs.
+
+  It scans for `{prefix}:*:meta`, the key BullMQ always writes, so the
+  result is language-agnostic. A job id is an arbitrary string and can
+  produce a key that ends the same way, so candidates carrying a `data`
+  field — which job hashes have and queue metadata does not — are
+  dropped in one pipelined round-trip. Cluster clients are scanned per
+  master, since SCAN is per-node.
+
+  SCAN is not free; this is an admin-path call, not a hot-path one.
+
 ### Fixed
 
 - `Stop` cancels the in-flight handlers before it talks to Redis rather

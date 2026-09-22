@@ -263,7 +263,9 @@ the asynq → mkq migration walkthrough.
 - **QueueEvents**: subscribe to BullMQ's `events` stream
   (added / active / completed / failed / progress / stalled / drained).
 - **Inspector** (read): `Queue.Counts`, `Queue.ListJobs`,
-  `Queue.Get`, `Client.Queues`.
+  `Queue.Get`, `Client.Queues`, `Client.DiscoverQueues` (SCAN-based, sees
+  queues mkq never Define'd — including ones created by BullMQ workers
+  in other languages).
 - **Inspector** (admin): `Queue.RemoveJob`, `Queue.DrainPending`,
   `Queue.PromoteJob`, `Queue.RetryJob`, `Queue.Pause`, `Queue.Resume`,
   `Queue.IsPaused`.
