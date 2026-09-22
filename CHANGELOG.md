@@ -6,6 +6,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Go 1.27.1. The `go` directive moves with it, so **consumers need a
+  1.27 toolchain**: a module declaring `go 1.27.1` cannot be built by an
+  older one. mkq's Go version tracks mk-go's, so the two need to move
+  together.
+
+### Fixed
+
+- `TestInterop_Wire_Priority` no longer depends on two jobs landing in
+  different milliseconds. It compared `completed` ZSET scores, which are
+  millisecond timestamps, so whenever both jobs finished inside the same
+  millisecond the strict ordering assertion had nothing to stand on and
+  the suite failed. It now reads the order of `active` events off the
+  events stream, which is what priority actually governs — the job is
+  dequeued first — and which keeps insertion order regardless of clock
+  resolution.
+
+  The flake predates this release; it surfaced while verifying the Go
+  bump (1 failure in 3 runs on 1.27.1, 0 in 5 on 1.26.6) and is a
+  property of the test, not of either toolchain.
+
 ### Security
 
 - Cleared the open Dependabot alerts.
