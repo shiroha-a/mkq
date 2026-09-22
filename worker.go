@@ -82,11 +82,21 @@ type Worker struct {
 	// deterministic jitter assertions.
 	rng func() float64
 
-	// runCtx is cancelled by Stop to break dispatch goroutines out of
-	// the dequeue loop. Each in-flight handler derives its job ctx
-	// from runCtx, so cancellation propagates automatically.
+	// runCtx is cancelled to break dispatch goroutines out of the
+	// dequeue loop. Both Stop and Drain cancel it: neither takes new
+	// work once shutdown has begun.
 	runCtx    context.Context
 	runCancel context.CancelFunc
+
+	// jobsCtx is the parent of every in-flight handler's context, and
+	// is deliberately *not* derived from runCtx.
+	//
+	// **この2つを分けているのが Drain の全部。** 同じ context を使い回すと
+	// 「新規 dequeue を止める」と「実行中の handler を cancel する」が
+	// 不可分になり、走っているジョブを完走させる余地が無くなる。Stop は
+	// 両方を cancel し、Drain は runCtx だけを cancel する。
+	jobsCtx    context.Context
+	jobsCancel context.CancelFunc
 
 	// run tracks every dispatch goroutine. Because dispatchLoop runs
 	// the handler synchronously (one in-flight job per loop), this
@@ -121,8 +131,9 @@ type queueKeys struct {
 }
 
 // Process starts a worker that pulls jobs from q and runs h on each.
-// Process returns once the worker goroutines are up; call Worker.Stop
-// to drain.
+// Process returns once the worker goroutines are up. Shut it down with
+// Worker.Drain to let the in-flight jobs finish, or Worker.Stop to
+// cancel them.
 func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, error) {
 	if q == nil {
 		return nil, errors.New("mkq: Process requires a non-nil queue")
@@ -149,6 +160,7 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	jobsCtx, jobsCancel := context.WithCancel(context.Background())
 	qk := newQueueKeys(q)
 	w := &Worker{
 		cfg:             cfg,
@@ -162,6 +174,8 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 		tracer:          q.client.tracer,
 		runCtx:          ctx,
 		runCancel:       cancel,
+		jobsCtx:         jobsCtx,
+		jobsCancel:      jobsCancel,
 		stopDone:        make(chan struct{}),
 		backoffStrategy: cfg.backoffStrategy,
 		backoffFunc:     cfg.backoffFunc,
@@ -218,31 +232,89 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 	return w, nil
 }
 
-// Stop signals the worker to stop dequeueing and waits for in-flight
-// jobs to finish. If ctx is cancelled before the in-flight jobs
-// complete, Stop returns ctx.Err(); the still-running handlers see
-// their own ctx cancelled and any subsequent moveToFinished call may
-// fail with a lock-mismatch error (logged, not surfaced).
+// Stop signals the worker to stop dequeueing, cancels the handlers that
+// are already running, and waits for them to return. If ctx is
+// cancelled before they do, Stop returns ctx.Err(); any subsequent
+// moveToFinished call may fail with a lock-mismatch error (logged, not
+// surfaced).
+//
+// Use Drain instead to let the in-flight jobs finish rather than
+// cancelling them.
 //
 // Stop is idempotent: subsequent calls block on the same internal
 // channel as the first, so a graceful-stop helper invoked from
 // multiple sites won't spawn extra waiter goroutines.
 func (w *Worker) Stop(ctx context.Context) error {
-	w.stopOnce.Do(func() {
-		w.runCancel()
-		w.wakeDispatchers()
-		go func() {
-			w.run.Wait()
-			w.dropWakeKey()
-			close(w.stopDone)
-		}()
-	})
+	// **cancel が先。** beginShutdown は wakeDispatchers で Redis を叩き、
+	// 相手が固まっていると最大 1 秒待つ。Redis が死んでいるから止めている、
+	// という場面がまさにそれなので、その裏で handler を放置してはいけない。
+	// 2 つの cancel は独立なので順序を入れ替えても他に影響はない。
+	w.jobsCancel()
+	w.beginShutdown()
 	select {
 	case <-w.stopDone:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// Drain stops dequeueing and waits for the handlers already running to
+// finish on their own. Unlike Stop it does not cancel them: an
+// in-flight job keeps its context, keeps its lock extended by the
+// heartbeat, and finishes normally.
+//
+// **これが要るのは、送信途中で切られたジョブが必ず再送になるから。** Stop で
+// 落とすと handler は cancel され、掴んでいたジョブは lock TTL が切れるまで
+// active に残り、stalled detection が回収して再試行する。BullMQ の
+// at-least-once 仕様どおりで正しさは保たれるが、配送系では「相手には届いて
+// いたのにもう一度送る」がデプロイのたびに出る。
+//
+// ctx bounds the wait. If it expires first, Drain cancels the running
+// handlers and returns ctx.Err() straight away — it does not wait for
+// them to unwind, because the budget the caller gave it is already
+// spent. Follow it with Stop on a fresh context to wait for them:
+//
+//	if err := worker.Drain(graceCtx); err != nil {
+//		// 猶予切れ。cancel は済んでいるので、巻き取りだけ待つ。
+//		_ = worker.Stop(unwindCtx)
+//	}
+//
+// **戻ってきた直後に Redis クライアントを閉じてはいけない。** handler が
+// finalise (moveToFinished) を撃つのはそこからなので、閉じるとジョブが
+// active に lock されたまま残り、stalled recovery が再配送する — Drain が
+// 避けたかったことがそのまま起きる。
+//
+// Drain and Stop share the same shutdown latch, so calling Stop after
+// Drain (or either one twice) is safe: the first call starts the
+// shutdown and every caller waits on the same channel.
+func (w *Worker) Drain(ctx context.Context) error {
+	w.beginShutdown()
+	select {
+	case <-w.stopDone:
+		return nil
+	case <-ctx.Done():
+		w.jobsCancel()
+		return ctx.Err()
+	}
+}
+
+// beginShutdown stops the dispatchers and starts the single waiter
+// goroutine. It is idempotent; the job contexts are left to the caller
+// so that Stop and Drain can differ on exactly that point.
+func (w *Worker) beginShutdown() {
+	w.stopOnce.Do(func() {
+		w.runCancel()
+		w.wakeDispatchers()
+		go func() {
+			w.run.Wait()
+			// 全部戻ったら job ctx tree も畳む。Drain が成功した場合は
+			// ここを通らないと cancel node が worker の寿命ぶん残る。
+			w.jobsCancel()
+			w.dropWakeKey()
+			close(w.stopDone)
+		}()
+	})
 }
 
 // maxIdleWait caps how long an idle dispatcher parks on the marker key.
@@ -377,7 +449,23 @@ func (w *Worker) dispatchLoop(handlerAny any) {
 	idleWait := w.cfg.idlePollInterval
 	for {
 		if w.runCtx.Err() != nil {
-			return
+			// **Drain のときは prefetch 済みを取りこぼさない。** 直前の
+			// moveToFinished が fetchNext=1 で返ってきていると、すでに
+			// wait->active へ移して lock まで取ったジョブを手元に抱えて
+			// いる。ここで捨てると active に置き去りになり、stalled
+			// recovery が拾うまで止まる — しかも beginShutdown は自分の
+			// stalledLoop も同時に落としている。新規を取らないだけの
+			// Drain の約束にも反する。
+			//
+			// 連鎖はしない: runCtx が cancel 済みなら fetchNextFlag が
+			// "0" を返すので、この 1 件を終えたら prefetched は nil になる。
+			//
+			// Stop (jobsCtx も cancel 済み) では今までどおり捨てる。handler は
+			// どうせ cancel 済み ctx を受け取るだけで、試行を 1 回無駄に
+			// 消費するより stalled recovery に任せたほうがよい。
+			if prefetched == nil || w.jobsCtx.Err() != nil {
+				return
+			}
 		}
 		if prefetched != nil {
 			// Consume the prefetched job from the previous moveToFinished
@@ -681,12 +769,13 @@ func (w *Worker) runJob(handlerAny any, token, jobID string, jobMap map[string]s
 // don't support fetchNext). Caller (dispatchLoop) consumes the
 // prefetched job on its next iteration without a moveToActive RTT.
 //
-// The per-job ctx is derived from runCtx so worker shutdown propagates
-// without a separate bridge goroutine. Heartbeat owns its own goroutine
-// because the BullMQ extendLock semantics require periodic ticks
-// independent of handler progress.
+// The per-job ctx is derived from jobsCtx, which Stop cancels and Drain
+// does not — that is what lets a drained worker run its in-flight jobs
+// to completion while taking no new ones. Heartbeat owns its own
+// goroutine because the BullMQ extendLock semantics require periodic
+// ticks independent of handler progress.
 func (w *Worker) processJob(handlerAny any, token, jobID string, jobMap map[string]string) *prefetchedJob {
-	jobCtx, cancelJob := context.WithCancel(w.runCtx)
+	jobCtx, cancelJob := context.WithCancel(w.jobsCtx)
 	defer cancelJob()
 
 	jobName := jobMap["name"]

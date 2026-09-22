@@ -8,6 +8,35 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Worker.Drain(ctx)` stops dequeueing and waits for the handlers that
+  are already running to finish **without cancelling them**. `Stop`
+  cancels them, which is the right thing when you need the process gone
+  now, but it means a job cut mid-flight stays locked until the BullMQ
+  lock expires and is then re-delivered by stalled detection.
+
+  For a delivery worker that shows up as "the remote already had it, and
+  we sent it again" on every deploy. `Drain` gives the in-flight work a
+  bounded chance to land first; when its context expires it falls back
+  to cancelling exactly as `Stop` does.
+
+  Internally the run context and the parent of the per-job contexts are
+  now separate. They used to be the same context, which made "stop
+  taking new work" and "cancel what is running" inseparable.
+
+  A `Drain` whose context expires cancels the handlers and returns
+  straight away — the budget it was given is spent. Follow it with
+  `Stop` on a fresh context to wait for them to unwind, and do not close
+  the Redis client until that returns: the handler finalises its job
+  after the cancellation, and a closed client turns the drain back into
+  the redelivery it was meant to avoid.
+
+### Fixed
+
+- `Stop` cancels the in-flight handlers before it talks to Redis rather
+  than after. The wake-up write it issues is bounded by a second, and
+  "Redis is wedged" is the usual reason for reaching for `Stop` — the
+  handlers should not sit uncancelled behind that round-trip.
+
 - `WithBackoffStrategyFunc` registers a custom backoff that receives the
   job context — id, name, attempt count, the error the handler returned,
   and the backoff type — instead of only the attempt count.
