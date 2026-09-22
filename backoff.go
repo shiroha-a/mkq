@@ -12,7 +12,8 @@ type BackoffStrategy struct {
 	// Type is "fixed", "exponential" (the values BullMQ recognises out
 	// of the box), or "custom" (BullMQ's settings.backoffStrategy
 	// path). For "custom", register the computation on the Worker via
-	// WithBackoffStrategy.
+	// WithBackoffStrategyFunc (job context available) or the older
+	// WithBackoffStrategy (attempt count only).
 	Type string
 	// Delay is the base delay; Type controls how it scales between
 	// retries. Ignored for "custom".
@@ -32,7 +33,64 @@ type BackoffStrategy struct {
 // This is where a caller reproduces an arbitrary formula plus cap plus
 // jitter Go-side. mkq never persists a cap to Redis (BullMQ has no cap
 // field, so a foreign worker would ignore it); capping belongs here.
+//
+// Returning a negative duration stops the retries and fails the job now,
+// matching what BullMQ does when settings.backoffStrategy returns -1.
+//
+// Implementations must be safe for concurrent use: one worker runs
+// `concurrency` dispatch goroutines and each calls the strategy
+// independently.
+//
+// BullMQ's own settings.backoffStrategy also receives the backoff type,
+// the handler error and the job; BackoffFunc plus WithBackoffStrategyFunc
+// expose those. Prefer them for anything that has to look at more than
+// the attempt count.
 type CustomBackoffFunc func(attemptsMade int) time.Duration
+
+// BackoffContext carries the job context a custom backoff strategy can
+// decide on: what BullMQ hands to settings.backoffStrategy as
+// (attemptsMade, type, err), plus the job's id and name.
+//
+// BullMQ passes the whole job, so a TypeScript strategy that keys its
+// delay off the payload has no direct equivalent here — put what the
+// delay depends on in the error instead, which is where the decision
+// usually lives anyway. Fields can be added later; they cannot be taken
+// away.
+type BackoffContext struct {
+	// JobID is the BullMQ job id.
+	JobID string
+	// Name is the BullMQ job name, which is how one queue fans out
+	// across task types. A strategy can back off differently per type.
+	Name string
+	// AttemptsMade is the post-bump attempt count (i.e. "this is
+	// attempt N"), the same value CustomBackoffFunc receives.
+	AttemptsMade int
+	// Err is the error the handler returned, or the synthesised error
+	// for a panic. Pull a retry hint out of a typed error with
+	// errors.As — an HTTP 429's Retry-After, say.
+	Err error
+	// BackoffType is the job's opts backoff type, "custom" for the
+	// BullMQ settings.backoffStrategy path.
+	BackoffType string
+}
+
+// BackoffFunc computes the retry delay for a job whose backoff Type is
+// not a BullMQ built-in, with the full job context available.
+//
+// **試行回数だけでは決められない遅延がある。** 相手が Retry-After で
+// 「30 秒後に来い」と言っているのに固定の式しか持てない、という状況が
+// 実際に起きる。CustomBackoffFunc はその文脈を受け取れないので、
+// こちらを使う。
+//
+// Returning a negative duration stops the retries and fails the job now,
+// matching what BullMQ does when settings.backoffStrategy returns -1.
+//
+// Implementations must be safe for concurrent use: one worker runs
+// `concurrency` dispatch goroutines and each calls the strategy
+// independently. **単一スレッドの BullMQ から移してくると、ホストごとの
+// 次回許可時刻を map に溜めるような実装を素直に書いてしまう。** Go では
+// そのままだと concurrent map writes で落ちる。
+type BackoffFunc func(BackoffContext) time.Duration
 
 // FixedBackoff retries on the same delay every attempt.
 func FixedBackoff(d time.Duration) BackoffStrategy {
@@ -63,9 +121,11 @@ func ExponentialBackoffWithJitter(d time.Duration, jitter float64) BackoffStrate
 
 // CustomBackoff marks a job as using the Worker-registered backoff
 // strategy (BullMQ's settings.backoffStrategy path). The on-Redis opts
-// store backoff as {"type": "custom"}; the actual delay is computed by
-// the CustomBackoffFunc registered via WithBackoffStrategy on the Worker
-// that processes the job.
+// store backoff as {"type": "custom"}; the actual delay is computed on
+// the Worker that processes the job, by the strategy registered via
+// WithBackoffStrategyFunc (which sees the job id, name, attempt count,
+// error and backoff type) or the older WithBackoffStrategy (attempt
+// count only). With neither registered the job retries immediately.
 //
 // This is the most flexible option: arbitrary formula, cap, and jitter
 // all live in the registered Go function, so mk-go can reproduce

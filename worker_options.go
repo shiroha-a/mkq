@@ -15,6 +15,7 @@ type workerConfig struct {
 	limiter          *workerLimiter
 	maxDataPoints    int // 0 = disabled (BullMQ-spec metrics off)
 	backoffStrategy  CustomBackoffFunc
+	backoffFunc      BackoffFunc
 }
 
 type workerLimiter struct {
@@ -136,6 +137,34 @@ func WithRateLimit(max int, duration time.Duration) WorkerOption {
 //	})
 func WithBackoffStrategy(fn CustomBackoffFunc) WorkerOption {
 	return func(c *workerConfig) { c.backoffStrategy = fn }
+}
+
+// WithBackoffStrategyFunc registers a custom backoff that receives the
+// whole job context rather than the attempt count alone: the job id and
+// name, the error the handler returned, and the backoff type.
+//
+// It is the closer analogue of BullMQ's
+// `new Worker(..., { settings: { backoffStrategy } })`, whose strategy
+// is called with (attemptsMade, type, err, job). Use it when the delay
+// depends on why the attempt failed:
+//
+//	mkq.WithBackoffStrategyFunc(func(bc mkq.BackoffContext) time.Duration {
+//		var rl *RateLimited
+//		if errors.As(bc.Err, &rl) {
+//			return rl.RetryAfter // 相手が明示した待ち時間に従う
+//		}
+//		return min(time.Duration(1<<bc.AttemptsMade)*time.Second, time.Hour)
+//	})
+//
+// Returning a negative duration stops the retries and fails the job now,
+// matching BullMQ's -1. The function must be safe for concurrent use;
+// one worker calls it from every dispatch goroutine.
+//
+// When both this and WithBackoffStrategy are given, this one is used
+// and the other is ignored (with a warning at Process time) — it can
+// express everything the attempt-count-only form can.
+func WithBackoffStrategyFunc(fn BackoffFunc) WorkerOption {
+	return func(c *workerConfig) { c.backoffFunc = fn }
 }
 
 // WithJobMetrics enables BullMQ-spec per-minute job-count metrics

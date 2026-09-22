@@ -74,6 +74,9 @@ type Worker struct {
 	// exponential). nil means custom-typed jobs fall back to immediate
 	// retry. See WithBackoffStrategy.
 	backoffStrategy CustomBackoffFunc
+	// backoffFunc is the context-aware form of the same hook. It wins
+	// when both are registered.
+	backoffFunc BackoffFunc
 	// rng returns a random float64 in [0, 1) for jitter. Defaults to
 	// math/rand/v2's package source; overridable in tests for
 	// deterministic jitter assertions.
@@ -161,6 +164,7 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 		runCancel:       cancel,
 		stopDone:        make(chan struct{}),
 		backoffStrategy: cfg.backoffStrategy,
+		backoffFunc:     cfg.backoffFunc,
 		rng:             rand.Float64,
 	}
 
@@ -187,6 +191,14 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 			slog.Int("concurrency", cfg.concurrency),
 			slog.Int("pool_size", effectivePoolSize),
 			slog.Int("recommended_minimum", cfg.concurrency+8),
+		)
+	}
+
+	// 登録された strategy が黙って無視されるのは、原因を追いづらい種類の
+	// 事故になる。どちらが使われるかを起動時に言っておく。
+	if cfg.backoffFunc != nil && cfg.backoffStrategy != nil {
+		w.logger.Warn("mkq: both WithBackoffStrategyFunc and WithBackoffStrategy are set; the context-aware one is used",
+			slog.String(AttrQueue, q.name),
 		)
 	}
 
@@ -1044,7 +1056,25 @@ func (w *Worker) finalise(jobID, token string, jobMap map[string]string, out han
 		return pf, finaliseStatusFailed, nil
 	}
 
-	delay := w.computeRetryDelay(jobOpts.backoff, atm+1)
+	delay := w.computeRetryDelay(jobOpts.backoff, BackoffContext{
+		JobID:        jobID,
+		Name:         jobMap["name"],
+		AttemptsMade: atm + 1,
+		Err:          out.err,
+	})
+
+	// **負の遅延は「もう再試行するな」。** BullMQ の settings.backoffStrategy は
+	// -1 を返すことで残りの試行を打ち切る (job.ts:790 の
+	// `delay == -1 ? false : true`)。TS から移してきた strategy がそのまま
+	// 動くよう、符号の意味を合わせる。合わせないと「諦めろ」が「今すぐ再送しろ」
+	// に反転し、残り試行を間髪入れずに焼き切ってしまう。
+	if delay < 0 {
+		pf, err := w.finishFailed(jobID, token, jobOpts, out.errReason, hist)
+		if err != nil {
+			return pf, finaliseStatusError, err
+		}
+		return pf, finaliseStatusFailed, nil
+	}
 	if delay > 0 {
 		if err := w.retryDelayed(jobID, token, delay, out.errReason, hist); err != nil {
 			return nil, finaliseStatusError, err
@@ -1302,27 +1332,59 @@ func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason s
 // For built-in types the un-jittered base is computed wire-faithfully
 // and, when BackoffStrategy.Jitter > 0, spread via applyJitter using
 // the BullMQ formula. For any non-built-in type ("custom") the
-// Worker-registered CustomBackoffFunc owns the entire computation
-// (formula + cap + jitter); with no strategy registered the job falls
-// back to immediate retry (delay 0) rather than panicking, so foreign
-// custom-typed jobs never wedge the worker.
-func (w *Worker) computeRetryDelay(b *BackoffStrategy, attemptsMade int) time.Duration {
-	if b == nil || attemptsMade < 1 {
+// Worker-registered strategy owns the entire computation (formula +
+// cap + jitter): WithBackoffStrategyFunc first, then the older
+// attempt-count-only WithBackoffStrategy. With neither registered the
+// job falls back to immediate retry (delay 0) rather than panicking, so
+// foreign custom-typed jobs never wedge the worker.
+func (w *Worker) computeRetryDelay(b *BackoffStrategy, bc BackoffContext) time.Duration {
+	if b == nil || bc.AttemptsMade < 1 {
 		return 0
 	}
+	bc.BackoffType = b.Type
 	switch b.Type {
 	case "fixed", "exponential":
-		base := computeBackoffDelay(b, attemptsMade)
+		base := computeBackoffDelay(b, bc.AttemptsMade)
 		if b.Jitter > 0 {
 			return applyJitter(base, b.Jitter, w.rng())
 		}
 		return base
 	default:
-		if w.backoffStrategy != nil {
-			return w.backoffStrategy(attemptsMade)
-		}
-		return 0
+		return w.callBackoffStrategy(bc)
 	}
+}
+
+// callBackoffStrategy invokes the user-registered strategy under panic
+// recovery.
+//
+// **ここは handler の recover の外側。** runHandler の defer はすでに戻って
+// いて、dispatchLoop 自身は recover を持たない。ユーザのコードが panic すると
+// dispatch goroutine ごと落ち、プロセスが死んで、掴んでいたジョブは lock TTL が
+// 切れるまで active に取り残される。文脈付きの strategy は errors.As と
+// フィールドアクセスを誘う分だけ panic しやすいので、ここで止める。
+func (w *Worker) callBackoffStrategy(bc BackoffContext) (d time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			if w.logger != nil {
+				w.logger.Error("mkq: backoff strategy panicked; retrying immediately",
+					slog.String(AttrQueue, w.queueName),
+					slog.String(AttrJobID, bc.JobID),
+					slog.Any("panic", r),
+				)
+			}
+			// 名前付き戻り値はこの時点でゼロのままなので、strategy 未登録時と
+			// 同じ「即時再試行」に落ちる。意図を明示するために代入しておく
+			// (挙動としては冗長)。
+			d = 0
+		}
+	}()
+	if w.backoffFunc != nil {
+		return w.backoffFunc(bc)
+	}
+	if w.backoffStrategy != nil {
+		return w.backoffStrategy(bc.AttemptsMade)
+	}
+	return 0
 }
 
 // jobOpts is the subset of the per-job opts JSON that the worker
