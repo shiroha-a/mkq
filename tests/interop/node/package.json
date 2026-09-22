@@ -12,7 +12,7 @@
   "dependencies": {
     "@bull-board/api": "6.13.1",
     "@bull-board/express": "6.13.1",
-    "bullmq": "5.76.2",
+    "bullmq": "6.3.8",
     "express": "4.22.3",
     "ioredis": "5.10.1"
   },
