@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-23
+
+### Changed
+
+- `golang.org/x/sync` 0.21.0 -> 0.23.0. It backs the `singleflight` used
+  for Lua script loading, and it is in the shipped `go.mod`, so it
+  reaches consumers. The bench harness's `ioredis` moved to 6.0.0 as
+  well; that one is test-only and ships in nothing.
+
 ### Fixed
 
 - A schedule's job template now survives rescheduling whole. mkq's
@@ -36,7 +45,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `repeat.count` stays excluded on purpose: BullMQ recomputes it from
   the scheduler HASH's `ic` at re-upsert time, so carrying a stale
   Go-side value would race.
-
 
 ## [1.2.0] - 2026-09-23
 
@@ -652,7 +660,8 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.2.1
 [1.2.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.2.0
 [1.1.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.1
 [1.1.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.0
