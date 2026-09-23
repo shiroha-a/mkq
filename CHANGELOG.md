@@ -6,24 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-
-- A retention age that rounds down to zero is no longer written to the
-  wire. `WithKeepCompletedAge(500 * time.Millisecond)` truncates to
-  `age: 0` at BullMQ's one-second resolution, and the two workers that
-  might read that job disagreed about what it means: mkq's own finish
-  path only sends `keepJobs.age` when it is positive, so nothing was
-  trimmed, while BullMQ TS passes the object through untouched and its
-  Lua then removes **everything** in the set scored at or before now —
-  including the job that had just completed.
-
-  The same job, the same options, opposite outcomes depending on which
-  language processed it. The age is now left off entirely when it
-  rounds to zero, which is what the godoc already promised. "Remove
-  immediately" remains expressible as `WithKeepCompleted(0)`.
-
-  Found while adding the scheduler-side options below, which would have
-  inherited the same behaviour.
+## [1.2.0] - 2026-09-23
 
 ### Added
 
@@ -62,8 +45,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
   job of the same kind finishes, so nothing is trimmed until the next
   iteration completes.
 
-
 ### Fixed
+
+- A retention age that rounds down to zero is no longer written to the
+  wire. `WithKeepCompletedAge(500 * time.Millisecond)` truncates to
+  `age: 0` at BullMQ's one-second resolution, and the two workers that
+  might read that job disagreed about what it means: mkq's own finish
+  path only sends `keepJobs.age` when it is positive, so nothing was
+  trimmed, while BullMQ TS passes the object through untouched and its
+  Lua then removes **everything** in the set scored at or before now —
+  including the job that had just completed.
+
+  The same job, the same options, opposite outcomes depending on which
+  language processed it. The age is now left off entirely when it
+  rounds to zero, which is what the godoc already promised. "Remove
+  immediately" remains expressible as `WithKeepCompleted(0)`.
+
+  Found while adding the scheduler-side options below, which would have
+  inherited the same behaviour.
 
 - The interop and bench harnesses declare `ioredis` again. **BullMQ 6
   moved it from a hard dependency to an optional peer dependency**, and
@@ -81,7 +80,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
   say in. That was true of 5 and stopped being true at 6.
 
   Test-only either way; no library code is affected.
-
 
 ## [1.1.1] - 2026-09-23
 
@@ -622,7 +620,8 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.2.0
 [1.1.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.1
 [1.1.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.0
 [1.0.8]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.8
