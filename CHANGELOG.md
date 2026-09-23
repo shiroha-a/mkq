@@ -6,6 +6,34 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `ListJobs` with `ascending=true` returned LIST-backed buckets (`wait`,
+  `paused`, `active`) in the wrong order: the right window, but newest
+  first inside it. Asking for a whole bucket ascending returned it
+  descending.
+
+  `getRanges-1.lua` reads those buckets with LRANGE and, for the
+  ascending case, translates the range to negative indices. That picks
+  the window from the old end; it does not reorder what comes back.
+  **BullMQ TS reverses the result client-side** for exactly this reason
+  (`src/classes/queue-getters.ts`, in `getRanges`); mkq did not, so the
+  two disagreed on an API both implement, and mkq's own godoc promised
+  an order it did not deliver.
+
+  The Lua is vendored and untouched — the reversal belongs Go-side,
+  which is where BullMQ puts it too. ZSET-backed buckets go through
+  `ZRANGE` / `ZREVRANGE` and were already correct; they are left alone.
+
+  Ordering now also holds across pages, so walking pages 0..n ascending
+  walks the bucket oldest to newest. An interop test pins mkq's output
+  against BullMQ TS's `Queue.getJobs` for the same arguments, and
+  separately checks that BullMQ TS really does return oldest first —
+  otherwise the comparison would pass with both sides broken.
+
+  Callers that passed `ascending=false` are unaffected.
+
+
 ## [1.1.0] - 2026-09-23
 
 ### Upgrade notes

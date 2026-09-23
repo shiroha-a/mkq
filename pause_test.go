@@ -527,7 +527,9 @@ func TestQueue_Counts_ReportsLegacyPausedList(t *testing.T) {
 	for _, j := range listed {
 		listedIDs = append(listedIDs, j.Job.ID)
 	}
-	assert.ElementsMatch(t, ids, listedIDs, "ListJobs(paused) must agree with Counts.Paused")
+	// legacy paused は wait を RENAME したものなので LIST ネイティブ順
+	// (新しい順)。ascending は他の LIST bucket と同じく古い順に直す。
+	assert.Equal(t, ids, listedIDs, "ListJobs(paused) must agree with Counts.Paused, oldest first")
 
 	// Resume で吸い出したあとは v6 の意味論だけが残る。
 	require.NoError(t, queue.Resume(ctx))
