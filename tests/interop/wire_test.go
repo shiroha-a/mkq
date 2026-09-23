@@ -14,6 +14,7 @@ package interop_test
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"sort"
 	"strconv"
 	"testing"
@@ -85,12 +86,29 @@ func TestInterop_Wire_Priority(t *testing.T) {
 		return n >= 2
 	})
 
-	processedAt := func(id string) float64 {
-		s, _ := rdb.ZScore(ctx, base+"completed", id).Result()
-		return s
+	// **完了時刻では判定できない。** completed ZSET のスコアはミリ秒なので、
+	// 2 件が同じミリ秒に収まると同値になり、順序の主張が立たない (実際に
+	// 断続的に落ちていた)。優先度が保証しているのは「先に取り出されること」
+	// なので、挿入順が保たれる events stream の active を見る。
+	entries, err := rdb.XRange(ctx, base+"events", "-", "+").Result()
+	require.NoError(t, err)
+
+	var activeOrder []string
+	for _, e := range entries {
+		if e.Values["event"] != "active" {
+			continue
+		}
+		if id, ok := e.Values["jobId"].(string); ok {
+			activeOrder = append(activeOrder, id)
+		}
 	}
-	assert.Less(t, processedAt(high.ID), processedAt(low.ID),
-		"priority=1 (high) must finish before priority=10 (low)")
+
+	highAt := slices.Index(activeOrder, high.ID)
+	lowAt := slices.Index(activeOrder, low.ID)
+	require.GreaterOrEqual(t, highAt, 0, "no active event for the high-priority job: %v", activeOrder)
+	require.GreaterOrEqual(t, lowAt, 0, "no active event for the low-priority job: %v", activeOrder)
+	assert.Less(t, highAt, lowAt,
+		"priority=1 (high) must be dequeued before priority=10 (low), got order %v", activeOrder)
 }
 
 // TestInterop_Wire_DelayPickup confirms BullMQ TS Worker honours
