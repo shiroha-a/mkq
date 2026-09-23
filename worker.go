@@ -997,7 +997,17 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 	endDate, _ := strconv.ParseInt(asString(vals[4]), 10, 64)
 	pattern := asString(vals[5])
 	tz := asString(vals[6])
-	template := proto.DecodeScheduleTemplateOpts(asString(vals[7]))
+	template, err := proto.DecodeScheduleTemplateOpts(asString(vals[7]))
+	if err != nil {
+		// HASH の opts が壊れている = データ破損 or 別 client が書き換えた。
+		// 空の template で積み直すことはできるが、attempts / priority が
+		// 黙って消えるので ops に見せる。次 iteration は出す。
+		w.logger.Error("mkq: scheduler template opts are unreadable; the next iteration loses them",
+			slog.String(AttrQueue, w.queueName),
+			slog.String("schedule_id", scheduleID),
+			slog.String(AttrError, err.Error()),
+		)
+	}
 
 	if everyMs <= 0 && pattern == "" {
 		// HASH が消えた、または不完全な状態。lua の prevMillis check に
