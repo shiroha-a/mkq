@@ -2,6 +2,7 @@ package mkq_test
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -203,4 +204,88 @@ func TestWorker_Stalled_HealthyWorkerNeverStalls(t *testing.T) {
 		require.NoError(t, err)
 	}
 	assert.True(t, stc == "" || stc == "0", "healthy worker must not bump stc, got %q", stc)
+}
+
+// TestWorker_Stalled_RepeatableJobIsNotHardFailed pins the one genuinely
+// new piece of wiring in the BullMQ 6 migration: moveStalledJobsToWait
+// gained KEYS[9] (the `repeat` key) so it can tell a scheduler-owned job
+// from an ordinary one.
+//
+// **BullMQ 6 で判定方法が変わった。** v5 は job HASH の `opts` を JSON
+// デコードして `repeat` があるかを見ていた。6 は `rjk` フィールドから
+// scheduler id を読み、`{repeat key}:{id}` の HASH が実在するかを確かめる。
+// つまり KEYS[9] に間違った key を渡すと判定が静かに false に倒れ、
+// 周期ジョブが stall 回数超過で恒久 fail する。Go 側が組み立てる KEYS は
+// ここでしか効かないので、専用のテストが無いと取り違えに気付けない。
+func TestWorker_Stalled_RepeatableJobIsNotHardFailed(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "tick")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	require.NoError(t, queue.UpsertScheduleEvery(ctx, "ticker", 100*time.Millisecond, testPayload{Inbox: "tick"}))
+
+	// ハンドラは返らない。周期ジョブは「完了してから次を積む」ので、
+	// インスタンスは最初の 1 件だけで増えない。
+	hold := func(ctx context.Context, _ *mkq.Job[testPayload]) (any, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	opts := []mkq.WorkerOption{
+		mkq.WithLockDuration(500 * time.Millisecond),
+		mkq.WithStalledInterval(300 * time.Millisecond),
+		mkq.WithIdlePollInterval(20 * time.Millisecond),
+		mkq.WithMaxStalledCount(1),
+	}
+	wA, err := mkq.Process(queue, hold, opts...)
+	require.NoError(t, err)
+	wB, err := mkq.Process(queue, hold, opts...)
+	require.NoError(t, err)
+	defer wA.Stop(context.Background())
+	defer wB.Stop(context.Background())
+
+	rdb := rawClient(t)
+	base := prefix + ":tick:"
+
+	// scheduler HASH が Lua の見に行く場所にあること。ここがずれていたら
+	// 以降の assert は「たまたま fail しなかった」だけになる。
+	exists, err := rdb.Exists(ctx, base+"repeat:ticker").Result()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, exists, "the scheduler HASH must live at {queue}:repeat:{id}")
+
+	// stc が maxStalledCount(1) を超えるまで待つ。超えて初めて
+	// 「fail するかしないか」の分岐に入るので、ここを待たないテストは
+	// 空虚になる。
+	var jobID string
+	waitFor(t, ctx, 20*time.Millisecond, func() bool {
+		ids, err := rdb.LRange(ctx, base+"active", 0, -1).Result()
+		if err != nil || len(ids) == 0 {
+			return false
+		}
+		jobID = ids[0]
+		return true
+	})
+	require.NotEmpty(t, jobID)
+
+	// stc は job HASH に残るので、取り違えで恒久 fail した場合でも
+	// active から消えたせいで待ち続ける、ということにはならない。
+	waitFor(t, ctx, 50*time.Millisecond, func() bool {
+		stc, _ := rdb.HGet(ctx, base+jobID, "stc").Int64()
+		return stc > 1
+	})
+	assert.True(t, strings.HasPrefix(jobID, "repeat:ticker:"), "unexpected job id %q", jobID)
+
+	rjk, err := rdb.HGet(ctx, base+jobID, "rjk").Result()
+	require.NoError(t, err)
+	require.Equal(t, "ticker", rjk, "the scheduler id must be stamped on the job as rjk")
+
+	// 周期ジョブは stall 回数超過でも恒久 fail しない。
+	defa, _ := rdb.HGet(ctx, base+jobID, "defa").Result()
+	assert.Empty(t, defa, "a scheduler-owned job must not be marked deferred-failed for stalling")
+
+	failedScore, _ := rdb.ZScore(ctx, base+"failed", jobID).Result()
+	assert.Zero(t, failedScore, "a scheduler-owned job must not be moved to failed for stalling")
 }

@@ -6,8 +6,21 @@ Lua scripts in this directory are vendored verbatim from BullMQ.
 - Source path: `src/commands/`
 - Pinned commit: see `.gitmodules` and the checked-out SHA of
   `third_party/bullmq` (recorded redundantly here:
-  `0866f39123010c9664fe32c1066f5e075faa4e23`, 2026-04-25)
+  `578ead3f575c8a3999e1a751b0cee7e34f6d936b`, 2026-09-18)
 - License: MIT (see `THIRD_PARTY_NOTICES.md` at the repo root)
+
+## Why the pin is a commit, not a tag
+
+BullMQ のリリースタグは、バージョンを上げる `chore(release)` コミットの
+**手前**に打たれる。つまり `v6.3.8` タグの `package.json` は `6.3.7` のままで、
+`6.3.8` と書かれているのは次のコミットになる。
+
+`lua sync verify` は `third_party/bullmq/package.json` の `version` と
+`tests/interop/node/package.json` の bullmq ピンを突き合わせるので、
+タグに合わせると必ず 1 バージョンずれて落ちる。そのため submodule は
+`chore(release)` コミット側に置く。`chore(release)` が触るのは changelog /
+`package.json` / `src/version.ts` だけで `src/commands/` は動かないため、
+Lua の中身はタグと同一になる。
 
 ## Why both submodule and vendored copies?
 
@@ -29,8 +42,8 @@ Entry points:
 - `extendLock-2.lua`
 - `releaseLock-1.lua`
 - `retryJob-11.lua`
-- `moveToDelayed-12.lua`
-- `moveStalledJobsToWait-8.lua`
+- `moveToDelayed-11.lua`
+- `moveStalledJobsToWait-9.lua`
 - `addJobScheduler-11.lua`
 - `updateJobScheduler-12.lua`
 - `updateProgress-3.lua`
@@ -41,7 +54,7 @@ Entry points:
 - `removeJob-2.lua`
 - `drain-5.lua`
 - `promote-9.lua`
-- `reprocessJob-8.lua`
+- `reprocessJob-7.lua`
 - `getMetrics-2.lua`
 - `pause-7.lua`
 

@@ -178,7 +178,7 @@ func WithBackoffStrategyFunc(fn BackoffFunc) WorkerOption {
 // bucket atomically alongside the state transition. Read the data
 // back via Queue.GetMetrics; bull-board / Misskey admin and other
 // BullMQ-aware dashboards see it directly because the keys and
-// layout are wire-compatible with BullMQ v5+.
+// layout are wire-compatible with BullMQ v6.
 //
 // The option name `JobMetrics` disambiguates from the unrelated
 // `mkq.Metrics` observability interface (Logger / Metrics / Tracer)

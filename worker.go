@@ -1375,7 +1375,7 @@ func (w *Worker) retryImmediate(jobID, token string, lifo bool, reason string, h
 	return nil
 }
 
-// retryDelayed re-enqueues with a delay via moveToDelayed-12.lua,
+// retryDelayed re-enqueues with a delay via moveToDelayed-11.lua,
 // honouring exponential / fixed backoff computed Go-side.
 func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason string, hist failureHistory) error {
 	now := time.Now().UnixMilli()
@@ -1864,29 +1864,33 @@ func (k queueKeys) retryJobKeys(jobID string) []string {
 	}
 }
 
-// moveStalledKeys assembles KEYS[1..8] for moveStalledJobsToWait-8.lua.
+// moveStalledKeys assembles KEYS[1..9] for moveStalledJobsToWait-9.lua.
 //
 //	KEYS[1] stalled SET   KEYS[2] wait LIST    KEYS[3] active LIST
 //	KEYS[4] stalled-check KEYS[5] meta         KEYS[6] paused
-//	KEYS[7] marker        KEYS[8] events stream
+//	KEYS[7] marker        KEYS[8] events stream KEYS[9] repeat
 func (k queueKeys) moveStalledKeys() []string {
+	// BullMQ 6 で KEYS[9] に repeat key が加わった。stalled 回収時に
+	// scheduler 由来のジョブを見分けるため。paused (KEYS[6]) は残っている。
 	return []string{
 		k.stalled, k.wait, k.active, k.stalledCheck, k.meta,
-		k.paused, k.marker, k.events,
+		k.paused, k.marker, k.events, k.repeat,
 	}
 }
 
-// moveToDelayedKeys assembles KEYS[1..12] for moveToDelayed-12.lua.
+// moveToDelayedKeys assembles KEYS[1..11] for moveToDelayed-11.lua.
 //
 //	KEYS[1]  marker     KEYS[2]  active      KEYS[3]  prioritized
 //	KEYS[4]  delayed    KEYS[5]  job key     KEYS[6]  events
 //	KEYS[7]  meta       KEYS[8]  stalled     KEYS[9]  wait
-//	KEYS[10] limiter    KEYS[11] paused      KEYS[12] pc
+//	KEYS[10] limiter    KEYS[11] pc
 func (k queueKeys) moveToDelayedKeys(jobID string) []string {
+	// BullMQ 6 で paused key が KEYS から外れた (pause 中でもジョブは wait に
+	// 入るので、行き先を分ける必要が無くなったため)。順序は
+	// moveToDelayed-11.lua のヘッダどおり。
 	return []string{
 		k.marker, k.active, k.prioritized, k.delayed, k.job(jobID),
-		k.events, k.meta, k.stalled, k.wait, k.limiter,
-		k.paused, k.pc,
+		k.events, k.meta, k.stalled, k.wait, k.limiter, k.pc,
 	}
 }
 

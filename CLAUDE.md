@@ -12,7 +12,7 @@ Design-level changes go through a mk-go PR. Implementation-level notes (godoc, i
 ## Reference implementations
 
 - **BullMQ** — authoritative for wire format. https://github.com/taskforcesh/bullmq
-  - Redis key layout, Job JSON shape, and Lua script semantics must stay compatible with BullMQ v5+.
+  - Redis key layout, Job JSON shape, and Lua script semantics must stay compatible with BullMQ v6.
   - Cross-check BullMQ source before writing any code that reads or writes Redis.
 - **asynq** — current mk-go driver, for semantic reference only. https://github.com/hibiken/asynq
 
@@ -39,7 +39,7 @@ All work is tracked via GitHub Issue → branch → Pull Request. No direct comm
 
 - Key naming, separator (`:`), and ID generation (INCR counter) follow BullMQ.
 - Job HASH field names (`data`, `opts`, `progress`, `returnvalue`, `stacktrace`, etc.) follow BullMQ.
-- State transitions and Lua script responsibilities mirror BullMQ v5+ (see design doc Section 5).
+- State transitions and Lua script responsibilities mirror BullMQ v6 (see design doc Section 5).
 - Divergence from BullMQ is allowed only at the API surface (Go generics / goroutines / context), never at the Redis wire format.
 
 ## Performance stance

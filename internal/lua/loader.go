@@ -39,8 +39,8 @@ const (
 	ExtendLock            ScriptName = "extendLock-2"
 	ReleaseLock           ScriptName = "releaseLock-1"
 	RetryJob              ScriptName = "retryJob-11"
-	MoveToDelayed         ScriptName = "moveToDelayed-12"
-	MoveStalledJobsToWait ScriptName = "moveStalledJobsToWait-8"
+	MoveToDelayed         ScriptName = "moveToDelayed-11"
+	MoveStalledJobsToWait ScriptName = "moveStalledJobsToWait-9"
 	AddJobScheduler       ScriptName = "addJobScheduler-11"
 	UpdateJobScheduler    ScriptName = "updateJobScheduler-12"
 	UpdateProgress        ScriptName = "updateProgress-3"
@@ -52,7 +52,7 @@ const (
 	RemoveJob             ScriptName = "removeJob-2"
 	Drain                 ScriptName = "drain-5"
 	Promote               ScriptName = "promote-9"
-	ReprocessJob          ScriptName = "reprocessJob-8"
+	ReprocessJob          ScriptName = "reprocessJob-7"
 	Pause                 ScriptName = "pause-7"
 )
 

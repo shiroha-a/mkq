@@ -50,7 +50,18 @@ type QueueCounts struct {
 	Prioritized int64
 	Completed   int64
 	Failed      int64
-	Paused      int64
+	// Paused is how many jobs are held back by a pause, and 0 when the
+	// queue is running. ListJobs(JobBucketPaused) returns exactly these
+	// jobs.
+	//
+	// **BullMQ 6 以降、paused は状態ではなくフラグ。** ジョブは wait に
+	// 残ったままなので、ここに載るのは「停止中の wait の件数」になる。
+	// 同じジョブは Wait にも数えられる。
+	//
+	// 例外は BullMQ 5 が pause したまま残していった legacy paused リスト。
+	// 空でなければその件数をそのまま返す (この場合は Wait と重複しない)。
+	// Resume が吸い出せば消え、以降は上の v6 の意味論だけになる。
+	Paused int64
 }
 
 // Counts returns the number of jobs currently sitting in each of the
@@ -61,13 +72,29 @@ type QueueCounts struct {
 // trip; pure-Go callers that only need one count are still better
 // off via the dedicated helper rather than repeated single-state
 // Counts calls.
+//
+// Requesting JobBucketPaused costs one extra round trip (HEXISTS on
+// `meta`), because under BullMQ 6 the `paused` list length no longer
+// answers the question on its own. Omit that bucket on hot paths that
+// do not need it.
 func (q *Queue[T]) Counts(ctx context.Context, buckets ...JobBucket) (QueueCounts, error) {
 	if len(buckets) == 0 {
 		buckets = allBuckets
 	}
 
-	args := make([]any, 0, len(buckets))
-	for _, b := range buckets {
+	// **BullMQ 6 で paused リストは使われなくなった。** pause してもジョブは
+	// wait に残り、gate は meta.paused のフラグだけが持つ。そのまま数えると
+	// Paused は常に 0 で、admin UI の「停止中に何件溜まっているか」に
+	// 答えられない。停止中は wait の件数をそこに載せる。
+	query := buckets
+	wantPaused := containsBucket(buckets, JobBucketPaused)
+	wantWait := containsBucket(buckets, JobBucketWait)
+	if wantPaused && !wantWait {
+		query = append(append(make([]JobBucket, 0, len(buckets)+1), buckets...), JobBucketWait)
+	}
+
+	args := make([]any, 0, len(query))
+	for _, b := range query {
 		args = append(args, string(b))
 	}
 	res, err := q.client.scripts.Run(
@@ -83,16 +110,51 @@ func (q *Queue[T]) Counts(ctx context.Context, buckets ...JobBucket) (QueueCount
 	if !ok {
 		return QueueCounts{}, fmt.Errorf("mkq: getCounts: unexpected result type %T", res)
 	}
-	if len(arr) != len(buckets) {
-		return QueueCounts{}, fmt.Errorf("mkq: getCounts: result length %d != buckets %d", len(arr), len(buckets))
+	if len(arr) != len(query) {
+		return QueueCounts{}, fmt.Errorf("mkq: getCounts: result length %d != buckets %d", len(arr), len(query))
 	}
 
 	var out QueueCounts
+	var waitCount int64
 	for i, raw := range arr {
 		n, _ := toInt64(raw)
-		assignBucket(&out, buckets[i], n)
+		if query[i] == JobBucketWait {
+			waitCount = n
+			if !wantWait {
+				// 呼び出し側が wait を求めていないなら、Paused の算出に
+				// 使うだけで結果には載せない。
+				continue
+			}
+		}
+		assignBucket(&out, query[i], n)
+	}
+
+	if wantPaused {
+		// ここまでで out.Paused には legacy paused リストの LLEN が入って
+		// いる。BullMQ 5 が pause したまま残していったジョブがそこにいる
+		// 場合は、それをそのまま paused として報告する (v5 のレイアウトを
+		// v5 の意味で読む)。Resume が吸い出せば 0 になり、以降は v6 の
+		// 意味論に切り替わる。
+		if out.Paused == 0 {
+			paused, err := q.IsPaused(ctx)
+			if err != nil {
+				return QueueCounts{}, err
+			}
+			if paused {
+				out.Paused = waitCount
+			}
+		}
 	}
 	return out, nil
+}
+
+func containsBucket(buckets []JobBucket, want JobBucket) bool {
+	for _, b := range buckets {
+		if b == want {
+			return true
+		}
+	}
+	return false
 }
 
 // assignBucket dispatches a per-bucket count into the corresponding

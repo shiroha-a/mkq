@@ -8,6 +8,62 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **BullMQ 6.** `third_party/bullmq` moves 5.76.2 -> 6.3.8 and the
+  vendored Lua with it, so mkq's wire target is now BullMQ v6. The
+  interop and bench harnesses move to `bullmq@6.3.8` to match.
+
+  Only one thing changed on the wire: **pause no longer relocates
+  jobs.** v5 renamed `wait` onto `paused` and routed jobs added during a
+  pause into `paused` as well. v6 leaves everything in `wait` and lets
+  the `meta.paused` flag alone gate the dequeue; `getTargetQueueList.lua`
+  is gone. Key naming, id generation, job HASH fields, the events stream,
+  schedulers, dedup, rate limiting and metrics are all unchanged.
+
+  The gate itself is compatible in both directions — v5 and v6 both
+  refuse to dequeue while `meta.paused` is set — so a v5 worker sharing
+  a queue mkq paused still stops. What differs is where the backlog sits
+  while paused.
+
+  Three entry points changed arity and so changed filename:
+  `moveToDelayed-12` -> `-11` and `reprocessJob-8` -> `-7` (both dropped
+  the now-pointless `paused` key), `moveStalledJobsToWait-8` -> `-9`
+  (gained the `repeat` key). Every entry point that kept its name kept
+  its KEYS order.
+
+- `Queue.Resume` now drains a legacy `paused` list in a loop. `pause-7`
+  gained a return value: how many jobs are still parked. It moves at
+  most 7000 per call so a long list cannot block Redis, which means one
+  call is no longer enough — a queue that BullMQ 5 paused with a large
+  backlog would have had everything past the first 7000 stranded.
+  Bounded at 100 rounds (700k jobs) so a Lua that never reports zero
+  cannot spin forever.
+
+- Two BullMQ 6 changes ride along in the vendored Lua. mkq's own API
+  touches neither, but both are visible to anything else sharing the
+  queue:
+
+  The legacy `debounced` event is gone from the events stream. v5
+  emitted it alongside `deduplicated` with a `debounceId` field; v6
+  emits only `deduplicated`. A foreign listener still subscribed to
+  `debounced` stops receiving anything. mkq never emitted or consumed
+  it.
+
+  A job suppressed under `keepLastIfActive` now keeps the id it was
+  given when it was added, instead of being re-created under a fresh
+  one when the active job finishes. mkq does not expose that
+  deduplication option (only `id` and `ttl`), so this only affects
+  queues a BullMQ TS writer shares.
+
+- `QueueCounts.Paused` and `ListJobs(JobBucketPaused)` answer "what is
+  held back right now" rather than "what is in the `paused` list", which
+  under v6 is always empty. While the queue is paused they report the
+  `wait` contents, so those jobs are counted under both `Paused` and
+  `Wait`. The exception is a queue paused by a BullMQ 5 writer: its
+  backlog really is in the legacy `paused` list, and that count is
+  reported as-is until `Resume` drains it. Both calls apply the same
+  rule in the same order — if they disagreed, an admin UI would show
+  "5 paused" over an empty table.
+
 - Interop harness: `@bull-board/api` and `@bull-board/express` 6.13.1 ->
   9.10.1, and `express` 4.22.3 -> 5.2.1. The three move together because
   `@bull-board/express@9` depends on `express@^5.2.1` outright, not as a

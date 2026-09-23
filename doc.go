@@ -1,7 +1,7 @@
 // Package mkq is a BullMQ-compatible Go-native job queue.
 //
 // mkq stores jobs in Redis using the same key layout, JSON shape, and
-// Lua atomic semantics as BullMQ v5+, so foreign workers in any
+// Lua atomic semantics as BullMQ v6, so foreign workers in any
 // language—or admin tools like bull-board—can share queues with mkq
 // without translation.
 //

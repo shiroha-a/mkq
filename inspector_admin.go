@@ -245,7 +245,8 @@ func (q *Queue[T]) RetryJob(ctx context.Context, jobID string, opts ...RetryOpti
 			stateKey,
 			q.keys.Wait(),
 			q.keys.Meta(),
-			q.keys.Paused(),
+			// BullMQ 6 で paused key が KEYS から外れた。pause 中でもジョブは
+			// wait に入るので、行き先を分ける必要が無くなったため。
 			q.keys.Active(),
 			q.keys.Marker(),
 		},
@@ -276,11 +277,14 @@ func (q *Queue[T]) RetryJob(ctx context.Context, jobID string, opts ...RetryOpti
 }
 
 // Pause stops the queue from handing jobs to workers, mirroring
-// BullMQ's Queue.pause(). It atomically sets the `meta.paused` flag and
-// renames the `wait` list onto `paused`, so any jobs already queued are
-// parked rather than dropped. Jobs enqueued while paused also land in
-// `paused` (addStandardJob honours the flag via getTargetQueueList), so
-// nothing is orphaned; Resume returns the whole set to `wait`.
+// BullMQ's Queue.pause(). It sets the `meta.paused` flag and drops the
+// marker; the queued jobs stay exactly where they are.
+//
+// **BullMQ 6 で pause はジョブを動かさなくなった。** v5 までは
+// `wait` を `paused` へ RENAME して退避し、pause 中の新規ジョブも
+// `paused` に入れていた。6 ではどちらも `wait` のままで、gate は
+// `meta.paused` のフラグだけが持つ。退避が無いぶん pause / resume の
+// コストがキューの長さに依存しない。
 //
 // The pause is global to the queue and shared via Redis, so every
 // worker process bound to the same queue honours it (the gate lives in
@@ -295,10 +299,20 @@ func (q *Queue[T]) Pause(ctx context.Context) error {
 }
 
 // Resume re-enables job processing on a paused queue, mirroring
-// BullMQ's Queue.resume(). It clears the `meta.paused` flag, renames the
-// `paused` list back onto `wait`, and pokes the marker ZSET so blocking
-// workers wake immediately instead of waiting out their BRPOPLPUSH
-// timeout.
+// BullMQ's Queue.resume(). It clears the `meta.paused` flag and pokes
+// the marker ZSET so blocking workers wake immediately instead of
+// waiting out their BRPOPLPUSH timeout.
+//
+// A queue paused by a BullMQ 5 worker (or by mkq before it followed
+// BullMQ 6) still has jobs parked in the legacy `paused` list. Resume
+// drains those back into `wait`, in batches, repeating until none are
+// left — the Lua moves at most 7000 per call so a long list cannot block
+// Redis.
+//
+// If that drain hits its round cap Resume returns an error, but the
+// queue is already running by then: the Lua clears `meta.paused` on its
+// first call. Calling Resume again continues the drain from where it
+// stopped.
 //
 // Equivalent to BullMQ pause-7.lua with ARGV "resumed". Idempotent:
 // resuming a queue that is not paused is a no-op at the wire level.
@@ -310,8 +324,34 @@ func (q *Queue[T]) Resume(ctx context.Context) error {
 // LIST keys to rename (wait->paused for pause, paused->wait for
 // resume); event is the BullMQ stream event ("paused" or "resumed")
 // that also selects the branch inside the Lua.
+// legacyDrainRounds caps how many times Resume re-runs to empty a
+// legacy `paused` list. The Lua moves up to 7000 jobs per call, so this
+// covers 700k parked jobs — far past anything a queue should be holding,
+// and bounded so a Lua that never reports zero cannot spin forever.
+const legacyDrainRounds = 100
+
 func (q *Queue[T]) pauseResume(ctx context.Context, source, target, event string) error {
-	_, err := q.client.scripts.Run(
+	for round := 0; ; round++ {
+		remaining, err := q.runPauseScript(ctx, source, target, event)
+		if err != nil {
+			return err
+		}
+		if remaining <= 0 {
+			return nil
+		}
+		// BullMQ 5 が残した paused リストを吸い出している最中。
+		// 1 回あたり 7000 件までなので、空になるまで繰り返す。
+		if round+1 >= legacyDrainRounds {
+			return fmt.Errorf("mkq: %s: %d jobs still parked in the legacy paused list after %d rounds",
+				event, remaining, legacyDrainRounds)
+		}
+	}
+}
+
+// runPauseScript runs pause-7.lua once and reports how many jobs are
+// still sitting in the legacy `paused` list.
+func (q *Queue[T]) runPauseScript(ctx context.Context, source, target, event string) (int64, error) {
+	res, err := q.client.scripts.Run(
 		ctx,
 		lua.Pause,
 		// pause-7.lua KEYS:
@@ -327,14 +367,19 @@ func (q *Queue[T]) pauseResume(ctx context.Context, source, target, event string
 			q.keys.Marker(),
 		},
 		event,
+		"1", // ARGV[2]: emit the paused / resumed event
 	)
-	// pause-7.lua はステータスコードを返さない (末尾は XADD)。返り値の
-	// 無い EVALSHA を go-redis は redis.Nil として surface するので成功
-	// 扱い。実エラー (NOSCRIPT 後の reload 失敗等) はそのまま伝播。
-	if err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("mkq: %s: %w", event, err)
+	// 返り値は legacy paused リストの残件数。BullMQ 5 の pause-7 は何も
+	// 返さず、go-redis はそれを redis.Nil として surface していたので、
+	// 5 系の script が残っている環境でも成功扱いにする。
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("mkq: %s: %w", event, err)
 	}
-	return nil
+	remaining, _ := res.(int64)
+	return remaining, nil
 }
 
 // IsPaused reports whether the queue is currently paused, mirroring
