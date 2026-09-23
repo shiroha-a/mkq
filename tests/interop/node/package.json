@@ -2,7 +2,7 @@
   "name": "mkq-interop",
   "version": "0.0.0",
   "private": true,
-  "description": "Node-side runner for mkq <-> BullMQ TS interop smoke tests. Pin matches third_party/bullmq submodule.",
+  "description": "Node-side runner for mkq <-> BullMQ TS interop smoke tests. Pin matches third_party/bullmq submodule. ioredis is explicit: BullMQ 6 made it an optional peer dependency, which npm does not install on its own.",
   "type": "module",
   "scripts": {
     "worker": "node worker.js",
@@ -13,6 +13,7 @@
     "@bull-board/api": "9.10.1",
     "@bull-board/express": "9.10.1",
     "bullmq": "6.3.8",
-    "express": "5.2.1"
+    "express": "5.2.1",
+    "ioredis": "5.10.1"
   }
 }

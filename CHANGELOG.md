@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The interop and bench harnesses declare `ioredis` again. **BullMQ 6
+  moved it from a hard dependency to an optional peer dependency**, and
+  npm does not install optional peers on its own, so `new Queue(...)`
+  fails at construction with "could not load the optional 'ioredis'
+  package".
+
+  Both harnesses kept working only because their lockfiles still carried
+  the entry npm had resolved back when BullMQ 5 depended on it outright.
+  Regenerating either lockfile would have dropped it and broken the
+  bull-board smoke test and the whole bench.
+
+  It was removed in the first place because `bullmq@5.76.2` pinned an
+  exact `ioredis`, which made the entry a copy of a decision it had no
+  say in. That was true of 5 and stopped being true at 6.
+
+  Test-only either way; no library code is affected.
+
+
 ## [1.1.1] - 2026-09-23
 
 ### Fixed
