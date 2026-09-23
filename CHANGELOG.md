@@ -8,6 +8,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Interop harness: `@bull-board/api` and `@bull-board/express` 6.13.1 ->
+  9.10.1, and `express` 4.22.3 -> 5.2.1. The three move together because
+  `@bull-board/express@9` depends on `express@^5.2.1` outright, not as a
+  peer.
+
+  `bullmq` stays at 5.76.2: bull-board 9 accepts `^5.56.0 || ^6.0.0`, so
+  it does not drag the BullMQ pin along — and that pin has to keep
+  matching `third_party/bullmq`, which is what the vendored Lua comes
+  from.
+
+  The `path-to-regexp` override is gone with it. It pinned 0.1.13 for
+  express 4; express 5 uses a newer one and the pin would have held it
+  back.
+
+  Harness-only, but the bull-board smoke test is the thing that proves
+  mkq's wire state renders in BullMQ's own admin UI, so the suite was run
+  locally against the bump.
+
 - Go 1.27.1. The `go` directive moves with it, so **consumers need a
   1.27 toolchain**: a module declaring `go 1.27.1` cannot be built by an
   older one. mkq's Go version tracks mk-go's, so the two need to move
