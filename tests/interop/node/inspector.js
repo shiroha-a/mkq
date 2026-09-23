@@ -5,7 +5,7 @@
 //   getJob <jobId>             — Job.fromId; emits the full Job JSON
 //   getState <jobId>           — Job.getState; emits {state}
 //   counts <s1> [s2 ...]       — Queue.getJobCounts(states...); emits {counts}
-//   getJobs <state> <start> <end> — Queue.getJobs([state], start, end); emits {ids}
+//   getJobs <state> <start> <end> [asc] — Queue.getJobs([state], start, end, asc); emits {ids}
 //   getJobLogs <jobId>         — Queue.getJobLogs(jobId); emits {logs, count}
 //
 // Env: INTEROP_REDIS / INTEROP_PREFIX / INTEROP_QUEUE
@@ -47,10 +47,11 @@ try {
       break;
     }
     case "getJobs": {
-      const [state, startStr, endStr] = args;
+      const [state, startStr, endStr, ascStr] = args;
       const start = parseInt(startStr ?? "0", 10);
       const end   = parseInt(endStr ?? "-1", 10);
-      const jobs = await queue.getJobs([state], start, end);
+      const asc   = ascStr === "true";
+      const jobs = await queue.getJobs([state], start, end, asc);
       result = { ids: jobs.map((j) => j.id) };
       break;
     }

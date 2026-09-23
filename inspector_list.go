@@ -3,6 +3,7 @@ package mkq
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/redis/go-redis/v9"
 
@@ -26,14 +27,17 @@ type ListedJob[T any] struct {
 //
 // The bucket determines fetch semantics inside the lua:
 //
-//   - LIST-backed buckets (wait, paused, active) honour insertion
-//     order; ascending=false reads in LIST-native order.
+//   - LIST-backed buckets (wait, paused, active) are read with LRANGE.
+//     ascending=false returns them in LIST-native order, which for
+//     BullMQ's LPUSH-backed lists is newest first.
 //   - ZSET-backed buckets (delayed, prioritized, completed, failed)
-//     read by score. Ascending applies in the obvious sense.
+//     read by score.
 //
 // Pass ascending=true to get the oldest-first / lowest-score-first
 // view that admin UIs typically want; ascending=false returns the
-// BullMQ default (newest first / highest score first).
+// BullMQ default (newest first / highest score first). Ordering holds
+// across pages, not just within one, so walking pages 0..n in
+// ascending order walks the bucket oldest to newest.
 //
 // Each returned ListedJob carries both the typed Job (with the user
 // payload decoded into T) and the JobState snapshot (terminal-state
@@ -102,8 +106,25 @@ func (q *Queue[T]) ListJobs(ctx context.Context, bucket JobBucket, start, end in
 	if len(ids) == 0 {
 		return []ListedJob[T]{}, nil
 	}
+	// **LIST は窓を選ぶだけで並べ替えない。** `getRangeInList` は asc のとき
+	// 負のインデックスへ読み替えて LRANGE する。これは「古い側から窓を取る」
+	// 処理であって、取れた窓の中は LIST ネイティブ順 (新しい順) のまま。
+	// bucket 全体を asc で取れば降順がそのまま返ってくる。
+	//
+	// BullMQ TS も同じ Lua を使い、同じ場所で反転している
+	// (`src/classes/queue-getters.ts` の getRanges)。ここを省くと同じキューを
+	// bull-board と並べたときに順序が食い違う。Lua は vendored なので触らない。
+	if ascending && isListBucket(source) {
+		slices.Reverse(ids)
+	}
 
 	return q.fetchJobs(ctx, ids)
+}
+
+// isListBucket reports whether a bucket is backed by a Redis LIST
+// rather than a ZSET. getRanges-1.lua branches on the same three names.
+func isListBucket(b JobBucket) bool {
+	return b == JobBucketWait || b == JobBucketPaused || b == JobBucketActive
 }
 
 // fetchJobs HGETALLs every id in a pipeline (one round-trip per
