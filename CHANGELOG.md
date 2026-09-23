@@ -26,6 +26,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   mkq's wire state renders in BullMQ's own admin UI, so the suite was run
   locally against the bump.
 
+- Interop harness: dropped the top-level `ioredis` dependency. Nothing in
+  the harness imports it — the five scripts import only `bullmq`,
+  `express` and the two bull-board packages — and `bullmq@5.76.2` depends
+  on `ioredis: 5.10.1` exactly, so the entry only ever mirrored a pin it
+  had no say over. Raising it (as an update PR proposed) would have
+  installed an unused second copy rather than upgrading anything.
+
 - Go 1.27.1. The `go` directive moves with it, so **consumers need a
   1.27 toolchain**: a module declaring `go 1.27.1` cannot be built by an
   older one. mkq's Go version tracks mk-go's, so the two need to move
