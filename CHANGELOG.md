@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-23
+
 ### Added
 
 - `WithRetryDelayOverride` decides a failed job's retry delay, or
@@ -47,7 +49,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
   **BullMQ has no counterpart.** This is an API-surface extension: the
   delay still reaches `moveToDelayed` as plain integer milliseconds, so
   nothing about the wire format changes.
-
 
 ## [1.2.1] - 2026-09-23
 
@@ -703,7 +704,8 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.3.0
 [1.2.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.2.1
 [1.2.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.2.0
 [1.1.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.1
