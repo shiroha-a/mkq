@@ -131,11 +131,19 @@ func EncodeAddOpts(o AddOpts) ([]byte, error) {
 // when only Count is supplied (matching BullMQ TS's `removeOnComplete:
 // 5` persistence), or a `{count?, age?}` object when Age is involved.
 // Returns nil for fully-unset input so the encoder can omit the key.
+//
+// **age==0 は書かない。** 秒未満を切り捨てて 0 になった age をそのまま
+// 載せると、読み手によって意味が正反対になる。mkq の finish path は
+// `Age > 0` でしか keepJobs に載せないので「刈らない」になるが、BullMQ TS の
+// getKeepJobs はオブジェクトをそのまま渡すので `maxAge = 0` となり、
+// `removeJobsByMaxAge` が now 以前の全件 — 今完了した job を含む — を消す。
+// 同じ job を誰が処理したかで結果が変わるのは wire として壊れている。
+// 「即時削除」は Count==0 で表現できるので、ここで落としても失うものは無い。
 func encodeRetentionLimit(r *RetentionLimit) any {
 	if r == nil {
 		return nil
 	}
-	if r.AgeSeconds == nil {
+	if r.AgeSeconds == nil || *r.AgeSeconds <= 0 {
 		if r.Count == nil {
 			return nil
 		}

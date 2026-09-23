@@ -21,6 +21,11 @@ type scheduleConfig struct {
 	startDate   time.Time
 	tz          string
 	immediately bool
+
+	// retention は「いつ発火するか」ではなく「各 iteration の job に
+	// どんな opts が載るか」の話なので、scheduleOpts ではなく template
+	// 側に入る。
+	template proto.ScheduleTemplateOpts
 }
 
 // ScheduleOption customises an UpsertScheduleEvery / UpsertSchedulePattern
@@ -62,6 +67,62 @@ func WithScheduleTimezone(tz string) ScheduleOption {
 // rejects the combination at upsertJobScheduler).
 func WithScheduleImmediately() ScheduleOption {
 	return func(c *scheduleConfig) { c.immediately = true }
+}
+
+// WithScheduleKeepCompleted bounds the completed ZSET for the jobs a
+// schedule creates, mirroring WithKeepCompleted on Add. n==0 removes
+// each iteration as soon as it completes; n>0 keeps the most recent n.
+//
+// **これを付けないと定期ジョブの completed は無期限に溜まる。** 週次の
+// 保守ジョブでも年単位で回れば数万件になり、job HASH もその数だけ残る。
+// BullMQ TS 側も同じ理由で template の opts に retention を置いている。
+func WithScheduleKeepCompleted(n int) ScheduleOption {
+	return func(c *scheduleConfig) {
+		c.template.RemoveOnComplete = mergeRetention(c.template.RemoveOnComplete, &n, nil)
+	}
+}
+
+// WithScheduleKeepCompletedAge drops completed iterations older than
+// age. Combine with WithScheduleKeepCompleted to bound by both.
+// BullMQ stores age at one-second resolution.
+func WithScheduleKeepCompletedAge(age time.Duration) ScheduleOption {
+	return func(c *scheduleConfig) {
+		secs := int(age.Seconds())
+		c.template.RemoveOnComplete = mergeRetention(c.template.RemoveOnComplete, nil, &secs)
+	}
+}
+
+// WithScheduleKeepFailed is the failed-side analogue of
+// WithScheduleKeepCompleted.
+func WithScheduleKeepFailed(n int) ScheduleOption {
+	return func(c *scheduleConfig) {
+		c.template.RemoveOnFail = mergeRetention(c.template.RemoveOnFail, &n, nil)
+	}
+}
+
+// WithScheduleKeepFailedAge is the failed-side analogue of
+// WithScheduleKeepCompletedAge.
+func WithScheduleKeepFailedAge(age time.Duration) ScheduleOption {
+	return func(c *scheduleConfig) {
+		secs := int(age.Seconds())
+		c.template.RemoveOnFail = mergeRetention(c.template.RemoveOnFail, nil, &secs)
+	}
+}
+
+// mergeRetention lets the count and age options be combined in either
+// order without one clearing the other.
+func mergeRetention(cur *proto.RetentionLimit, count, ageSeconds *int) *proto.RetentionLimit {
+	out := &proto.RetentionLimit{}
+	if cur != nil {
+		out.Count, out.AgeSeconds = cur.Count, cur.AgeSeconds
+	}
+	if count != nil {
+		out.Count = count
+	}
+	if ageSeconds != nil {
+		out.AgeSeconds = ageSeconds
+	}
+	return out
 }
 
 // UpsertScheduleEvery registers (or replaces) a fixed-interval
@@ -130,7 +191,7 @@ func (q *Queue[T]) UpsertScheduleEvery(
 
 	// every-mode は ARGV[1]="0" → lua が getJobSchedulerEveryNextMillis
 	// で次 millis を再計算する。
-	return q.upsertSchedule(ctx, scheduleID, "0", scheduleOpts, string(dataJSON))
+	return q.upsertSchedule(ctx, scheduleID, "0", scheduleOpts, cfg.template, string(dataJSON))
 }
 
 // UpsertSchedulePattern registers (or replaces) a cron-pattern
@@ -211,7 +272,7 @@ func (q *Queue[T]) UpsertSchedulePattern(
 	}
 	nextMillis := strconv.FormatInt(firstFire.UnixMilli(), 10)
 
-	return q.upsertSchedule(ctx, scheduleID, nextMillis, scheduleOpts, string(dataJSON))
+	return q.upsertSchedule(ctx, scheduleID, nextMillis, scheduleOpts, cfg.template, string(dataJSON))
 }
 
 // upsertSchedule is the wire-level call shared by UpsertScheduleEvery,
@@ -223,13 +284,14 @@ func (q *Queue[T]) upsertSchedule(
 	scheduleID string,
 	nextMillis string,
 	scheduleOpts proto.ScheduleOpts,
+	template proto.ScheduleTemplateOpts,
 	dataJSON string,
 ) error {
 	scheduleOptsBytes, err := proto.EncodeScheduleOpts(scheduleOpts)
 	if err != nil {
 		return fmt.Errorf("mkq: encode schedule opts: %w", err)
 	}
-	templateOptsBytes, err := proto.EncodeScheduleTemplateOpts()
+	templateOptsBytes, err := proto.EncodeScheduleTemplateOpts(template)
 	if err != nil {
 		return fmt.Errorf("mkq: encode template opts: %w", err)
 	}
@@ -237,7 +299,7 @@ func (q *Queue[T]) upsertSchedule(
 	// 自前で再スケジュールするとき opts.repeat.every / pattern を
 	// 参照するので、foreign worker と互換にするため repeat ブロックを
 	// 必ず埋める。
-	delayedOptsBytes, err := proto.EncodeScheduleDelayedOpts(scheduleOpts)
+	delayedOptsBytes, err := proto.EncodeScheduleDelayedOpts(scheduleOpts, template)
 	if err != nil {
 		return fmt.Errorf("mkq: encode delayed opts: %w", err)
 	}

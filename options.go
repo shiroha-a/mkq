@@ -112,7 +112,9 @@ func WithKeepFailed(n int) AddOption {
 // WithKeepCompletedAge drops completed jobs older than age relative
 // to each subsequent finalisation tick. Mirrors BullMQ's
 // `removeOnComplete: { age: <seconds> }`. Resolution is one second;
-// sub-second values round to zero (no trim).
+// a sub-second value rounds to zero and the age is left off the wire
+// entirely, so nothing is trimmed by age — on any worker, not just
+// mkq's. Use WithKeepCompleted(0) to mean "remove immediately".
 //
 // Combine with WithKeepCompleted to cap by both count and age in
 // the same call (BullMQ's `{count, age}` shape).

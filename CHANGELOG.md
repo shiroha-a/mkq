@@ -8,6 +8,63 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A retention age that rounds down to zero is no longer written to the
+  wire. `WithKeepCompletedAge(500 * time.Millisecond)` truncates to
+  `age: 0` at BullMQ's one-second resolution, and the two workers that
+  might read that job disagreed about what it means: mkq's own finish
+  path only sends `keepJobs.age` when it is positive, so nothing was
+  trimmed, while BullMQ TS passes the object through untouched and its
+  Lua then removes **everything** in the set scored at or before now —
+  including the job that had just completed.
+
+  The same job, the same options, opposite outcomes depending on which
+  language processed it. The age is now left off entirely when it
+  rounds to zero, which is what the godoc already promised. "Remove
+  immediately" remains expressible as `WithKeepCompleted(0)`.
+
+  Found while adding the scheduler-side options below, which would have
+  inherited the same behaviour.
+
+### Added
+
+- `WithScheduleKeepCompleted` / `WithScheduleKeepCompletedAge` and their
+  failed-side counterparts put retention on the jobs a schedule creates.
+  Until now `UpsertScheduleEvery` / `UpsertSchedulePattern` had no way to
+  bound them, so a recurring job's completed and failed records grew
+  without limit — a queue running a few hundred iterations a day
+  accumulates tens of thousands of entries and the job HASHes to match.
+
+  The retention lands in two places, because two different writers queue
+  the iterations. It goes on the scheduler HASH's `opts` template, which
+  is what a **BullMQ TS** worker reads when it schedules the next
+  iteration, and on each iteration's own job opts, which is what
+  `moveToFinished` consults. Put it in only one and the retention
+  silently stops applying on whichever path you missed — mkq's worker
+  now reads the template back for exactly this reason.
+
+  The wire shapes match what BullMQ TS's `upsertJobScheduler` persists
+  for the same options, pinned by an interop test that drives BullMQ's
+  own scheduler and compares field for field.
+
+  **On an existing backlog**, the two forms behave differently, and this
+  is upstream BullMQ behaviour rather than anything mkq chooses:
+
+  - `...Age` removes at most 1000 entries per completion (BullMQ's
+    `keepJobs.limit` default), so a large backlog drains over several
+    completions without any one of them blocking Redis.
+  - `...KeepCompleted` / `...KeepFailed` remove **everything past the
+    count in a single pass**, with no limit. Turning a count on against
+    a set with tens of thousands of entries means one long-running Lua
+    call. Prefer the age form when retro-fitting retention onto a queue
+    that has been accumulating.
+
+  Neither form runs on a timer: BullMQ evaluates retention only when a
+  job of the same kind finishes, so nothing is trimmed until the next
+  iteration completes.
+
+
+### Fixed
+
 - The interop and bench harnesses declare `ioredis` again. **BullMQ 6
   moved it from a hard dependency to an optional peer dependency**, and
   npm does not install optional peers on its own, so `new Queue(...)`

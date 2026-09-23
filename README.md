@@ -138,6 +138,28 @@ err = queue.UpsertSchedulePattern(ctx, "midnight-job", "0 0 * * *", Email{},
 )
 ```
 
+**Bound the records a schedule leaves behind**, or they grow without
+limit — a job running a few hundred times a day accumulates tens of
+thousands of completed entries and the job HASHes to match:
+
+```go
+err := queue.UpsertScheduleEvery(ctx, "maintenance", time.Hour, Email{},
+    mkq.WithScheduleKeepCompletedAge(7*24*time.Hour),
+    mkq.WithScheduleKeepFailedAge(7*24*time.Hour),
+)
+```
+
+The retention rides on the scheduler template, so it also applies to
+iterations a BullMQ worker in another language queues.
+
+Retro-fitting this onto a queue that has already accumulated: prefer
+the age form. It removes at most 1000 entries per completion, so a
+large backlog drains over several runs. The count form
+(`WithScheduleKeepCompleted`) removes everything past the count in one
+pass, which on a set of tens of thousands means a single long Lua call.
+Neither runs on a timer — BullMQ trims only when a job of the same kind
+finishes.
+
 ### Inspector
 
 Read-only admin lookup (cross-compatible with bull-board's view of
@@ -289,7 +311,9 @@ the asynq → mkq migration walkthrough.
   WithRateLimit, WithWorkerName, WithBackoffStrategy /
   WithBackoffStrategyFunc, WithJobMetrics.
 - **Recurring schedules**: every-mode and cron-pattern mode, with
-  WithScheduleLimit / StartDate / EndDate / Timezone / Immediately.
+  WithScheduleLimit / StartDate / EndDate / Timezone / Immediately, and
+  per-iteration retention via WithScheduleKeepCompleted /
+  WithScheduleKeepCompletedAge (and the failed-side pair).
 - **QueueEvents**: subscribe to BullMQ's `events` stream
   (added / active / completed / failed / progress / stalled / drained).
 - **Inspector** (read): `Queue.Counts`, `Queue.ListJobs`,
