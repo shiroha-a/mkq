@@ -977,10 +977,14 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 	// every / pattern のいずれかが必須 (両者とも未設定なら HASH が
 	// 消えている = no-op で終了)。HMGET は scheduler が消えていれば
 	// nil を返すので、その場合は startDate/endDate も nil で安全。
+	// **`opts` も読む。** scheduler HASH の `opts` は各 iteration が継承する
+	// job opts (retention 等) で、BullMQ TS の Worker も再スケジュール時に
+	// ここを読んで次の opts を組み立てている。読まずに repeat だけで組み直すと
+	// 1 回目の iteration にしか retention が載らない。
 	vals, err := w.rdb.HMGet(ctx, scheduleKey,
-		"limit", "ic", "every", "startDate", "endDate", "pattern", "tz",
+		"limit", "ic", "every", "startDate", "endDate", "pattern", "tz", "opts",
 	).Result()
-	if err != nil || len(vals) != 7 {
+	if err != nil || len(vals) != 8 {
 		return
 	}
 	limit := parseInt(asString(vals[0]))
@@ -993,6 +997,7 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 	endDate, _ := strconv.ParseInt(asString(vals[4]), 10, 64)
 	pattern := asString(vals[5])
 	tz := asString(vals[6])
+	template := proto.DecodeScheduleTemplateOpts(asString(vals[7]))
 
 	if everyMs <= 0 && pattern == "" {
 		// HASH が消えた、または不完全な状態。lua の prevMillis check に
@@ -1008,7 +1013,7 @@ func (w *Worker) rescheduleNext(scheduleID, currentJobID string) {
 		EndDate:   endDate,
 		Limit:     limit,
 	}
-	delayedOpts, err := proto.EncodeScheduleDelayedOpts(scheduleProto)
+	delayedOpts, err := proto.EncodeScheduleDelayedOpts(scheduleProto, template)
 	if err != nil {
 		return
 	}

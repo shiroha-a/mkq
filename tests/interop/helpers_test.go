@@ -116,8 +116,15 @@ func runNodeEnqueuerOpts(t *testing.T, prefix, queueName, payloadJSON string, op
 // subprocess exits.
 func runNodeInspector(t *testing.T, prefix, queueName string, out any, args ...string) {
 	t.Helper()
+	runNodeScript(t, "inspector.js", prefix, queueName, out, args...)
+}
+
+// runNodeScript is runNodeInspector for any of the single-shot harness
+// scripts that take the same env and emit one JSON line.
+func runNodeScript(t *testing.T, script, prefix, queueName string, out any, args ...string) {
+	t.Helper()
 	dir := nodeDir(t)
-	cmd := exec.Command("node", append([]string{"inspector.js"}, args...)...)
+	cmd := exec.Command("node", append([]string{script}, args...)...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"INTEROP_REDIS="+redisAddr(),
@@ -126,8 +133,8 @@ func runNodeInspector(t *testing.T, prefix, queueName string, out any, args ...s
 	)
 	cmd.Stderr = os.Stderr
 	stdout, err := cmd.Output()
-	require.NoError(t, err, "inspector.js %v failed", args)
-	require.NoError(t, json.Unmarshal(stdout, out), "inspector.js %v stdout: %s", args, string(stdout))
+	require.NoError(t, err, "%s %v failed", script, args)
+	require.NoError(t, json.Unmarshal(stdout, out), "%s %v stdout: %s", script, args, string(stdout))
 }
 
 // startWorkerProcess starts the given subprocess, drains stdout for
