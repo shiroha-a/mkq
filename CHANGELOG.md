@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-23
+
 ### Fixed
 
 - `ListJobs` with `ascending=true` returned LIST-backed buckets (`wait`,
@@ -543,7 +545,8 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.1
 [1.1.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.0
 [1.0.8]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.8
 [1.0.7]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.7
