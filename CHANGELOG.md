@@ -6,6 +6,49 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `WithRetryDelayOverride` decides a failed job's retry delay, or
+  declines and leaves it to the job's configured backoff. It is
+  consulted for every backoff type, and for jobs carrying no backoff at
+  all.
+
+  It fills the gap the BullMQ-shaped hooks cannot: a queue on
+  exponential backoff that should nonetheless honour a 429's
+  `Retry-After` when the server sends one.
+
+  ```go
+  mkq.WithRetryDelayOverride(func(bc mkq.BackoffContext) (time.Duration, bool) {
+      var ra *RetryAfterError
+      if errors.As(bc.Err, &ra) {
+          return min(ra.After, time.Hour), true
+      }
+      return 0, false // 他は設定どおり
+  })
+  ```
+
+  Without it the only way to express that was to switch the queue to
+  `backoff.type: "custom"`, which means owning the whole curve —
+  returning 0 there is "retry immediately", not "use the default" — and
+  which writes `custom` into the job's opts, so a BullMQ worker in
+  another language reading the same queue would lose its backoff too.
+  The override rewrites nothing on the wire.
+
+  `WithBackoffStrategy` and `WithBackoffStrategyFunc` are unchanged and
+  remain the BullMQ `settings.backoffStrategy` analogue for
+  custom-typed jobs; the override composes with them rather than
+  replacing them.
+
+  A negative duration gives up and fails the job, as a custom strategy
+  does. A panic is caught, logged, and treated as a decline — not as
+  delay 0, which would quietly turn a considered backoff into a hot
+  loop against whatever just failed.
+
+  **BullMQ has no counterpart.** This is an API-surface extension: the
+  delay still reaches `moveToDelayed` as plain integer milliseconds, so
+  nothing about the wire format changes.
+
+
 ## [1.2.1] - 2026-09-23
 
 ### Changed

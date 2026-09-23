@@ -194,3 +194,30 @@ func applyJitter(base time.Duration, jitter, r float64) time.Duration {
 	minDelay := float64(base) * (1 - jitter)
 	return time.Duration(r*float64(base)*jitter + minDelay)
 }
+
+// RetryDelayFunc decides the delay before a failed job's next attempt,
+// or declines to decide.
+//
+// Returning (d, true) uses d. Returning (_, false) leaves the decision
+// to the job's configured backoff, exactly as if no override were
+// registered — including the built-in fixed / exponential curves and
+// their jitter.
+//
+// **「普段は設定どおり、この失敗のときだけ別の遅延」を書くためのもの。**
+// BullMQ の settings.backoffStrategy (mkq では WithBackoffStrategy /
+// WithBackoffStrategyFunc) は backoff type が custom のときしか呼ばれない
+// ので、指数バックオフのキューで相手の Retry-After に従いたい、という形が
+// 書けなかった。custom に切り替えればできるが、カーブ全体を持つことになる
+// うえ `opts.backoff.type` が Redis に載って BullMQ TS 側の挙動まで変わる。
+//
+// Returning a negative duration stops the retries and fails the job,
+// the same as a custom strategy doing so.
+//
+// Implementations must be safe for concurrent use: every dispatch
+// goroutine calls this independently. A panic is caught, logged, and
+// treated as a decline.
+//
+// **BullMQ に対応物は無い。** mkq の拡張で、API surface にしか現れない —
+// 遅延は既存の moveToDelayed に整数ミリ秒で渡るだけなので、wire format は
+// 変わらないし opts.backoff も書き換わらない。
+type RetryDelayFunc func(BackoffContext) (time.Duration, bool)
