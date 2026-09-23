@@ -51,6 +51,22 @@ because both came from the same upstream tag.
 When the submodule pin moves, bump `bullmq` in
 `tests/interop/node/package.json` to match.
 
+## Why ioredis is listed explicitly
+
+`ioredis` is a direct dependency here even though nothing in the harness
+imports it. **BullMQ 6 moved it from a hard dependency to an optional
+peer dependency**, and npm does not install optional peers on its own.
+Without it, `new Queue(...)` fails at construction:
+
+```
+BullMQ could not load the optional 'ioredis' package.
+```
+
+Under BullMQ 5 the entry really was redundant — `bullmq` depended on an
+exact version — and it was removed on that basis. That reasoning stopped
+holding at 6. Do not remove it again without checking which way the
+current pin declares it.
+
 ## CI
 
 Lives in `.github/workflows/interop.yml`. Runs on every push and PR

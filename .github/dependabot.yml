@@ -29,6 +29,11 @@ updates:
   # **bullmq のピンは third_party/bullmq submodule と対になっている。**
   # package.json にもそう書いてある。bullmq を上げる PR が来たら、submodule も
   # 同じタグに動かさないと「vendored Lua と照合している相手」がずれる。
+  #
+  # **ioredis は明示的に入れてある。消さないこと。** BullMQ 6 で必須依存から
+  # optional peer dependency に変わり、npm は自動では入れなくなった。外すと
+  # `new Queue(...)` が「could not load the optional 'ioredis' package」で
+  # 落ちる。bullmq が依存しているから要らない、という判断は 5 系の話。
   - package-ecosystem: npm
     directory: /tests/interop/node
     schedule:
