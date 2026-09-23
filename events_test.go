@@ -96,7 +96,7 @@ func TestQueueEvents_BasicFlow(t *testing.T) {
 		return map[string]any{"ok": true}, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	job, err := queue.Add(ctx, testPayload{Inbox: "x"})
 	require.NoError(t, err)
@@ -140,7 +140,7 @@ func TestQueueEvents_FailedEvent(t *testing.T) {
 		return nil, errors.New("bad")
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	_, err = queue.Add(ctx, testPayload{})
 	require.NoError(t, err)

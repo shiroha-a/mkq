@@ -64,7 +64,7 @@ func TestWorker_BackoffContext_SeesTheJobAndTheError(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
-	defer func() { _ = worker.Stop(context.Background()) }()
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -120,7 +120,7 @@ func TestWorker_BackoffContext_AttemptOnlyFormStillWorks(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
-	defer func() { _ = worker.Stop(context.Background()) }()
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -168,7 +168,7 @@ func TestWorker_BackoffContext_DelayIsHonoured(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
-	defer func() { _ = worker.Stop(context.Background()) }()
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -216,7 +216,7 @@ func TestWorker_BackoffContext_NegativeDelayStopsRetrying(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
-	defer func() { _ = worker.Stop(context.Background()) }()
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -260,13 +260,17 @@ func TestWorker_BackoffContext_PanicInStrategyDoesNotKillTheWorker(t *testing.T)
 	},
 		mkq.WithIdlePollInterval(10*time.Millisecond),
 		mkq.WithBackoffStrategyFunc(func(mkq.BackoffContext) time.Duration {
+			// **panic させるのがこのテストの目的。** strategy が落ちても
+			// worker が死なないことを見ている。nil map への書き込みは
+			// 「うっかり」で起きる代表例なので、わざとらしい panic() より
+			// 現実の事故に近い。
 			var m map[string]time.Time
-			m["host"] = time.Now() // nil map への書き込みで panic
+			m["host"] = time.Now() //nolint:staticcheck // SA5000: 意図的
 			return time.Second
 		}),
 	)
 	require.NoError(t, err)
-	defer func() { _ = worker.Stop(context.Background()) }()
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"

@@ -75,7 +75,7 @@ func TestSchedule_LimitStops(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	waitFor(t, ctx, 50*time.Millisecond, func() bool {
 		return seen.Load() >= int64(limit)
@@ -121,7 +121,7 @@ func TestSchedule_EndDateStops(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	// endDate 超過後は新しい iteration が積まれないので、ある時点で
 	// 確実に増加が止まる。 endDate + 数 iteration 分の余裕で待機。
@@ -206,7 +206,7 @@ func TestSchedule_RemoveStops(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	// 少なくとも 1 回は動かす。
 	waitFor(t, ctx, 30*time.Millisecond, func() bool { return seen.Load() >= 1 })
@@ -250,7 +250,7 @@ func TestSchedule_OverrideUpsert(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	// 速い周期なら 1 秒以内に 2 回以上発火するはず。slow のままなら
 	// 1 秒では 0 回しか出ない。

@@ -57,7 +57,7 @@ func TestTracer_Start_RecordsAttributes(t *testing.T) {
 	for _, kv := range s.Attributes {
 		if w, ok := want[string(kv.Key)]; ok {
 			if kv.Value != w {
-				t.Errorf("attr %q = %v, want %v", kv.Key, kv.Value.Emit(), w.Emit())
+				t.Errorf("attr %q = %v, want %v", kv.Key, kv.Value.String(), w.String())
 			}
 			delete(want, string(kv.Key))
 		}

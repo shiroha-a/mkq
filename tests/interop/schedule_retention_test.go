@@ -170,7 +170,7 @@ func TestInterop_ScheduleTemplate_SurvivesMkqReschedule(t *testing.T) {
 		return nil, nil
 	}, mkq.WithConcurrency(1), mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	var nextID string
 	deadline := time.Now().Add(20 * time.Second)

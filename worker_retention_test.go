@@ -41,7 +41,7 @@ func TestWorker_Retention_KeepCompletedTrims(t *testing.T) {
 		mkq.WithIdlePollInterval(10*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -79,7 +79,7 @@ func TestWorker_Retention_KeepCompletedZeroRemovesJob(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -120,7 +120,7 @@ func TestWorker_Retention_DefaultKeepsAll(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -162,7 +162,7 @@ func TestWorker_Retention_KeepCompletedAgeTrims(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -220,7 +220,7 @@ func TestWorker_Retention_KeepFailedTrims(t *testing.T) {
 		mkq.WithIdlePollInterval(10*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"

@@ -4,6 +4,7 @@ package interop_test
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/shiroha-a/mkq"
 )
 
 // nodeWorkerOpts customises a startNodeWorker call beyond the
@@ -262,4 +265,21 @@ func joinComma(parts []string) string {
 		out += p
 	}
 	return out
+}
+
+// stopWorker tears a worker down at test end.
+//
+// **Stop の戻り値を捨てない。** 失敗は「drain が終わらなかった」という情報で、
+// goroutine と Redis 接続が残ったまま後続のテストに影響しうる。テスト自体を
+// 落とすほどではないので log に出す。
+//
+// 本体パッケージの同名ヘルパ (queue_test.go) と同じもの。テストヘルパは
+// パッケージを跨げないので、同じ意図を 2 箇所に置いている。
+func stopWorker(t *testing.T, w *mkq.Worker) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := w.Stop(ctx); err != nil {
+		t.Logf("worker did not stop cleanly: %v", err)
+	}
 }

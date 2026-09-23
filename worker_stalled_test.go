@@ -79,7 +79,7 @@ func TestWorker_Stalled_RecoversFromDeadWorker(t *testing.T) {
 		mkq.WithStalledInterval(300*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer liveWorker.Stop(context.Background())
+	defer stopWorker(t, liveWorker)
 
 	// Stalled detection in BullMQ requires two ticks: the first
 	// adds the dead worker's active job to the stalled SET, the
@@ -135,8 +135,8 @@ func TestWorker_Stalled_FailsAfterMaxStalledCount(t *testing.T) {
 		mkq.WithMaxStalledCount(1),
 	)
 	require.NoError(t, err)
-	defer wA.Stop(context.Background())
-	defer wB.Stop(context.Background())
+	defer stopWorker(t, wA)
+	defer stopWorker(t, wB)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -185,7 +185,7 @@ func TestWorker_Stalled_HealthyWorkerNeverStalls(t *testing.T) {
 		mkq.WithIdlePollInterval(20*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -244,8 +244,8 @@ func TestWorker_Stalled_RepeatableJobIsNotHardFailed(t *testing.T) {
 	require.NoError(t, err)
 	wB, err := mkq.Process(queue, hold, opts...)
 	require.NoError(t, err)
-	defer wA.Stop(context.Background())
-	defer wB.Stop(context.Background())
+	defer stopWorker(t, wA)
+	defer stopWorker(t, wB)
 
 	rdb := rawClient(t)
 	base := prefix + ":tick:"

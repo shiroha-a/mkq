@@ -42,7 +42,7 @@ func TestWorker_RateLimit_Throttles(t *testing.T) {
 		mkq.WithIdlePollInterval(20*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -88,7 +88,7 @@ func TestWorker_RateLimit_DisabledByDefault(t *testing.T) {
 		mkq.WithIdlePollInterval(20*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -125,7 +125,7 @@ func TestWorker_RateLimit_ZeroDisablesLimiter(t *testing.T) {
 		mkq.WithIdlePollInterval(20*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"

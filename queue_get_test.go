@@ -77,7 +77,7 @@ func TestJob_RuntimeFieldsPopulatedAtDequeue(t *testing.T) {
 		return nil, errors.New("force retry")
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	// Three attempts: atm=0,1,2 in order; ats increments each dequeue;
 	// pb is non-empty (worker name) on every attempt.
@@ -114,7 +114,7 @@ func TestQueue_Get_CompletedJob(t *testing.T) {
 		return map[string]any{"ok": true}, nil
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -156,7 +156,7 @@ func TestQueue_Get_FailedJob(t *testing.T) {
 		return nil, errors.New("nope")
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"

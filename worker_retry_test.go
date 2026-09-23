@@ -38,7 +38,7 @@ func TestWorker_Retry_FixedBackoffExhausts(t *testing.T) {
 		return nil, fmt.Errorf("attempt %d failed", n)
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -74,7 +74,7 @@ func TestWorker_Retry_ExponentialBackoffSchedules(t *testing.T) {
 	require.NoError(t, err)
 
 	var times []int64
-	var mu chan struct{} = make(chan struct{}, 1)
+	mu := make(chan struct{}, 1)
 	mu <- struct{}{}
 	worker, err := mkq.Process(queue, func(_ context.Context, _ *mkq.Job[testPayload]) (any, error) {
 		<-mu
@@ -83,7 +83,7 @@ func TestWorker_Retry_ExponentialBackoffSchedules(t *testing.T) {
 		return nil, errors.New("nope")
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -140,7 +140,7 @@ func TestWorker_Retry_CustomBackoffSchedules(t *testing.T) {
 		return nil, errors.New("nope")
 	}, mkq.WithIdlePollInterval(10*time.Millisecond), mkq.WithBackoffStrategy(strategy))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -185,7 +185,7 @@ func TestWorker_Retry_NoAttemptsDefaultIsOneShot(t *testing.T) {
 		return nil, errors.New("boom")
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -220,7 +220,7 @@ func TestWorker_Retry_UnrecoverableSkipsRetry(t *testing.T) {
 		return nil, fmt.Errorf("hard fail: %w", mkq.ErrUnrecoverable)
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -263,7 +263,7 @@ func TestWorker_Retry_UnrecoverableSuppressesRetriesExhaustedEvent(t *testing.T)
 		return nil, fmt.Errorf("hard fail: %w", mkq.ErrUnrecoverable)
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -300,7 +300,7 @@ func TestWorker_Retry_StacktraceFieldShape(t *testing.T) {
 		return nil, errors.New("kaput")
 	}, mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"

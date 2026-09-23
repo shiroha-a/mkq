@@ -41,6 +41,21 @@ func uniquePrefix(t *testing.T) string {
 	return fmt.Sprintf("mkqtest-%s-%d", t.Name(), time.Now().UnixNano())
 }
 
+// stopWorker tears a worker down at test end.
+//
+// **Stop の戻り値を捨てない。** 失敗は「drain が終わらなかった」という情報で、
+// goroutine と Redis 接続が残ったまま後続のテストに影響しうる。テスト自体を
+// 落とすほどではないので log に出す — `defer w.Stop(ctx)` と書くと、その情報が
+// どこにも出ずに消える。
+func stopWorker(t *testing.T, w *mkq.Worker) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := w.Stop(ctx); err != nil {
+		t.Logf("worker did not stop cleanly: %v", err)
+	}
+}
+
 func newClient(t *testing.T, prefix string) *mkq.Client {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
