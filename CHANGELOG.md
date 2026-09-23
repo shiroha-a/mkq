@@ -6,6 +6,82 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-23
+
+### Upgrade notes
+
+Three things in this release need a decision before upgrading.
+
+- **Go 1.27 toolchain required.** The `go` directive is now `1.27.1`;
+  an older toolchain cannot build a module that declares it. mkq's Go
+  version tracks mk-go's, so the two move together.
+- **`QueueCounts.Paused` counts something different.** It used to be the
+  length of the `paused` list, which under BullMQ 6 is always empty. It
+  now reports what is actually held back. Dashboards reading this field
+  keep working; anything asserting "paused is 0 while jobs are parked"
+  does not.
+- **A backoff strategy returning a negative duration now fails the
+  job** instead of retrying immediately. If a strategy used a negative
+  return to mean "retry now", change it to return 0.
+
+Wire format is unchanged except for pause, which is covered below.
+
+### Added
+
+- `Worker.Drain(ctx)` stops dequeueing and waits for the handlers that
+  are already running to finish **without cancelling them**. `Stop`
+  cancels them, which is the right thing when you need the process gone
+  now, but it means a job cut mid-flight stays locked until the BullMQ
+  lock expires and is then re-delivered by stalled detection.
+
+  For a delivery worker that shows up as "the remote already had it, and
+  we sent it again" on every deploy. `Drain` gives the in-flight work a
+  bounded chance to land first; when its context expires it falls back
+  to cancelling exactly as `Stop` does.
+
+  Internally the run context and the parent of the per-job contexts are
+  now separate. They used to be the same context, which made "stop
+  taking new work" and "cancel what is running" inseparable.
+
+  A `Drain` whose context expires cancels the handlers and returns
+  straight away — the budget it was given is spent. Follow it with
+  `Stop` on a fresh context to wait for them to unwind, and do not close
+  the Redis client until that returns: the handler finalises its job
+  after the cancellation, and a closed client turns the drain back into
+  the redelivery it was meant to avoid.
+
+- `Client.DiscoverQueues` enumerates the queues actually present in
+  Redis under the client's key prefix, including ones mkq never
+  `Define`'d — a queue created by a BullMQ worker in another language,
+  or by another process. `Queues` answers "what does this process work
+  on"; this answers "what is in this deployment", which is what a
+  dashboard or an admin CLI needs.
+
+  It scans for `{prefix}:*:meta`, the key BullMQ always writes, so the
+  result is language-agnostic. A job id is an arbitrary string and can
+  produce a key that ends the same way, so candidates carrying a `data`
+  field — which job hashes have and queue metadata does not — are
+  dropped in one pipelined round-trip. Cluster clients are scanned per
+  master, since SCAN is per-node.
+
+  SCAN is not free; this is an admin-path call, not a hot-path one.
+
+- `WithBackoffStrategyFunc` registers a custom backoff that receives the
+  job context — id, name, attempt count, the error the handler returned,
+  and the backoff type — instead of only the attempt count.
+
+  This closes a parity gap rather than adding a mkq-ism: BullMQ's own
+  `settings.backoffStrategy` is called with
+  `(attemptsMade, type, err, job)` (see
+  `third_party/bullmq/src/types/backoff-strategy.ts`), while mkq's
+  `CustomBackoffFunc` dropped the last three. **Without the error there
+  is no way to honour an HTTP 429's `Retry-After`**, or to back off
+  differently depending on why the attempt failed.
+
+  `WithBackoffStrategy` keeps working unchanged. Registering both logs a
+  warning at `Process` time and uses the context-aware one, since it can
+  express everything the other can.
+
 ### Changed
 
 - **BullMQ 6.** `third_party/bullmq` moves 5.76.2 -> 6.3.8 and the
@@ -94,6 +170,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
   older one. mkq's Go version tracks mk-go's, so the two need to move
   together.
 
+- A custom backoff strategy that returns a **negative** duration now
+  stops the retries and fails the job, matching BullMQ, whose
+  `settings.backoffStrategy` uses `-1` for exactly that
+  (`third_party/bullmq/src/classes/job.ts`: `delay == -1 ? false : true`).
+  Previously any non-positive return fell through to an immediate retry,
+  so a strategy ported from TypeScript had its "give up" inverted into
+  "resend now" and burned the remaining attempts back to back.
+
+  This affects `WithBackoffStrategy` as well as the new option. A
+  strategy that returned a negative duration meaning "retry immediately"
+  should return 0 instead.
+
 ### Fixed
 
 - `TestInterop_Wire_Priority` no longer depends on two jobs landing in
@@ -108,6 +196,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
   The flake predates this release; it surfaced while verifying the Go
   bump (1 failure in 3 runs on 1.27.1, 0 in 5 on 1.26.6) and is a
   property of the test, not of either toolchain.
+
+- `Stop` cancels the in-flight handlers before it talks to Redis rather
+  than after. The wake-up write it issues is bounded by a second, and
+  "Redis is wedged" is the usual reason for reaching for `Stop` — the
+  handlers should not sit uncancelled behind that round-trip.
+
+- A panic inside a registered backoff strategy no longer takes the
+  worker process down. It runs after `runHandler`'s recover has
+  returned and the dispatch loop has none of its own, so the goroutine
+  unwound and the job it held stayed locked in `active` until stalled
+  recovery. The panic is now logged and the job retried immediately.
+
+  No Redis wire format change: the delay still reaches Lua as a plain
+  integer.
 
 ### Security
 
@@ -128,94 +230,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
   The harness is test-only and ships in no binary, but it runs in CI and
   a bull-board smoke test depends on express, so the interop suite was
   run locally against the bump before it landed.
-
-### Added
-
-- `Worker.Drain(ctx)` stops dequeueing and waits for the handlers that
-  are already running to finish **without cancelling them**. `Stop`
-  cancels them, which is the right thing when you need the process gone
-  now, but it means a job cut mid-flight stays locked until the BullMQ
-  lock expires and is then re-delivered by stalled detection.
-
-  For a delivery worker that shows up as "the remote already had it, and
-  we sent it again" on every deploy. `Drain` gives the in-flight work a
-  bounded chance to land first; when its context expires it falls back
-  to cancelling exactly as `Stop` does.
-
-  Internally the run context and the parent of the per-job contexts are
-  now separate. They used to be the same context, which made "stop
-  taking new work" and "cancel what is running" inseparable.
-
-  A `Drain` whose context expires cancels the handlers and returns
-  straight away — the budget it was given is spent. Follow it with
-  `Stop` on a fresh context to wait for them to unwind, and do not close
-  the Redis client until that returns: the handler finalises its job
-  after the cancellation, and a closed client turns the drain back into
-  the redelivery it was meant to avoid.
-
-- `Client.DiscoverQueues` enumerates the queues actually present in
-  Redis under the client's key prefix, including ones mkq never
-  `Define`'d — a queue created by a BullMQ worker in another language,
-  or by another process. `Queues` answers "what does this process work
-  on"; this answers "what is in this deployment", which is what a
-  dashboard or an admin CLI needs.
-
-  It scans for `{prefix}:*:meta`, the key BullMQ always writes, so the
-  result is language-agnostic. A job id is an arbitrary string and can
-  produce a key that ends the same way, so candidates carrying a `data`
-  field — which job hashes have and queue metadata does not — are
-  dropped in one pipelined round-trip. Cluster clients are scanned per
-  master, since SCAN is per-node.
-
-  SCAN is not free; this is an admin-path call, not a hot-path one.
-
-### Fixed
-
-- `Stop` cancels the in-flight handlers before it talks to Redis rather
-  than after. The wake-up write it issues is bounded by a second, and
-  "Redis is wedged" is the usual reason for reaching for `Stop` — the
-  handlers should not sit uncancelled behind that round-trip.
-
-- `WithBackoffStrategyFunc` registers a custom backoff that receives the
-  job context — id, name, attempt count, the error the handler returned,
-  and the backoff type — instead of only the attempt count.
-
-  This closes a parity gap rather than adding a mkq-ism: BullMQ's own
-  `settings.backoffStrategy` is called with
-  `(attemptsMade, type, err, job)` (see
-  `third_party/bullmq/src/types/backoff-strategy.ts`), while mkq's
-  `CustomBackoffFunc` dropped the last three. **Without the error there
-  is no way to honour an HTTP 429's `Retry-After`**, or to back off
-  differently depending on why the attempt failed.
-
-  `WithBackoffStrategy` keeps working unchanged. Registering both logs a
-  warning at `Process` time and uses the context-aware one, since it can
-  express everything the other can.
-
-### Changed
-
-- A custom backoff strategy that returns a **negative** duration now
-  stops the retries and fails the job, matching BullMQ, whose
-  `settings.backoffStrategy` uses `-1` for exactly that
-  (`third_party/bullmq/src/classes/job.ts`: `delay == -1 ? false : true`).
-  Previously any non-positive return fell through to an immediate retry,
-  so a strategy ported from TypeScript had its "give up" inverted into
-  "resend now" and burned the remaining attempts back to back.
-
-  This affects `WithBackoffStrategy` as well as the new option. A
-  strategy that returned a negative duration meaning "retry immediately"
-  should return 0 instead.
-
-### Fixed
-
-- A panic inside a registered backoff strategy no longer takes the
-  worker process down. It runs after `runHandler`'s recover has
-  returned and the dispatch loop has none of its own, so the goroutine
-  unwound and the job it held stayed locked in `active` until stalled
-  recovery. The panic is now logged and the job retried immediately.
-
-  No Redis wire format change: the delay still reaches Lua as a plain
-  integer.
 
 ## [1.0.8] - 2026-08-24
 
@@ -501,7 +515,10 @@ fix bugs without breaking existing callers.
   TS pull ahead 1.24× at concurrency=16. Documented as the
   Redis-client-level gap in `bench/README.md`.
 
-[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.0.6...HEAD
+[Unreleased]: https://github.com/shiroha-a/mkq/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/shiroha-a/mkq/releases/tag/v1.1.0
+[1.0.8]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.8
+[1.0.7]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.7
 [1.0.6]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.6
 [1.0.5]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.5
 [1.0.4]: https://github.com/shiroha-a/mkq/releases/tag/v1.0.4
