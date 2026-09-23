@@ -200,7 +200,7 @@ func TestWorker_Drain_DeadlineFallsBackToCancelling(t *testing.T) {
 		return nil, nil
 	}, mkq.WithConcurrency(1), mkq.WithIdlePollInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	defer func() { _ = worker.Stop(context.Background()) }()
+	defer stopWorker(t, worker)
 
 	select {
 	case <-entered:

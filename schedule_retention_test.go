@@ -97,7 +97,7 @@ func TestSchedule_RetentionSurvivesReschedule(t *testing.T) {
 		return nil, nil
 	}, mkq.WithConcurrency(1), mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	// 2 本目以降が積まれるまで待つ。1 本目は Upsert が積んだもの。
 	waitFor(t, ctx, 50*time.Millisecond, func() bool { return seen.Load() >= 2 })
@@ -134,7 +134,7 @@ func TestSchedule_RetentionTrimsCompleted(t *testing.T) {
 		return nil, nil
 	}, mkq.WithConcurrency(1), mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	waitFor(t, ctx, 50*time.Millisecond, func() bool { return seen.Load() >= 4 })
 
@@ -166,7 +166,7 @@ func TestSchedule_WithoutRetentionCompletedAccumulates(t *testing.T) {
 		return nil, nil
 	}, mkq.WithConcurrency(1), mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	waitFor(t, ctx, 50*time.Millisecond, func() bool {
 		counts, err := queue.Counts(ctx, mkq.JobBucketCompleted)

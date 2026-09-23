@@ -103,7 +103,7 @@ func TestWorker_Process_HandlerError(t *testing.T) {
 		return nil, errors.New("boom")
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -136,7 +136,7 @@ func TestWorker_Process_Panic(t *testing.T) {
 		panic("kaboom")
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -179,7 +179,7 @@ func TestWorker_Process_Concurrency(t *testing.T) {
 		mkq.WithIdlePollInterval(20*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -227,7 +227,7 @@ func TestWorker_Process_SerialJobsOnSingleSlot(t *testing.T) {
 		mkq.WithIdlePollInterval(20*time.Millisecond),
 	)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
@@ -263,7 +263,7 @@ func TestWorker_Process_PriorityOrderingWithinPrioritized(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	first := receiveOrFail(t, ctx, order)
 	second := receiveOrFail(t, ctx, order)
@@ -300,7 +300,7 @@ func TestWorker_Process_DelayedJobRunsAfterDelay(t *testing.T) {
 		return nil, nil
 	}, mkq.WithIdlePollInterval(20*time.Millisecond))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	got := receiveOrFail(t, ctx, ranAt)
 	elapsed := got.Sub(addedAt)

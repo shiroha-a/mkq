@@ -52,7 +52,7 @@ func runUntilDelayed(
 		return nil, handlerErr
 	}, append(base, opts...)...)
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	waitFor(t, ctx, 20*time.Millisecond, func() bool {
 		if failed.Load() == 0 {
@@ -182,7 +182,7 @@ func TestRetryDelayOverride_NegativeFailsTheJob(t *testing.T) {
 			return -1, true
 		}))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	waitFor(t, ctx, 50*time.Millisecond, func() bool {
 		counts, err := queue.Counts(ctx, mkq.JobBucketFailed)
@@ -310,7 +310,7 @@ func TestRetryDelayOverride_NotConsultedOnceAttemptsAreSpent(t *testing.T) {
 			return time.Hour, true
 		}))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	waitFor(t, ctx, 50*time.Millisecond, func() bool {
 		counts, err := queue.Counts(ctx, mkq.JobBucketFailed)
@@ -348,7 +348,7 @@ func TestRetryDelayOverride_NotConsultedOnUnrecoverable(t *testing.T) {
 			return time.Hour, true
 		}))
 	require.NoError(t, err)
-	defer worker.Stop(context.Background())
+	defer stopWorker(t, worker)
 
 	waitFor(t, ctx, 50*time.Millisecond, func() bool {
 		counts, err := queue.Counts(ctx, mkq.JobBucketFailed)
