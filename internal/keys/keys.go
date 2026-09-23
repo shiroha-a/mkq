@@ -55,7 +55,7 @@ func (b Builder) Meta() string { return b.Base() + "meta" }
 // ID is the INCR counter for auto-generated job ids.
 func (b Builder) ID() string { return b.Base() + "id" }
 
-// Marker is BullMQ v5+'s blocking-worker wakeup ZSET.
+// Marker is BullMQ's blocking-worker wakeup ZSET.
 func (b Builder) Marker() string { return b.Base() + "marker" }
 
 // PriorityCounter (BullMQ "pc") breaks ties between equal-priority jobs

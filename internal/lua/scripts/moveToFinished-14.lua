@@ -1,5 +1,5 @@
 --[[
-  Move job from active to a finished status (completed o failed)
+  Move job from active to a finished status (completed or failed)
   A job can only be moved to completed if it was active.
   The job must be locked before it can be moved to a finished status,
   and the lock must be released in this script.
@@ -127,7 +127,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- Make sure job exists
 
     local eventStreamKey = KEYS[4]
     local metaKey = KEYS[9]
-    -- Trim events before emiting them to avoid trimming events emitted in this script
+    -- Trim events before emitting them to avoid trimming events emitted in this script
     trimEvents(metaKey, eventStreamKey)
 
     local prefix = ARGV[7]
@@ -213,7 +213,7 @@ if rcall("EXISTS", jobIdKey) == 1 then -- Make sure job exists
     -- and not rate limited.
     if (ARGV[6] == "1") then
         local result = fetchNextJob(KEYS[1], KEYS[2], KEYS[3], eventStreamKey,
-            KEYS[6], KEYS[7], KEYS[8], metaKey, KEYS[10], KEYS[14], prefix,
+            KEYS[6], KEYS[7], metaKey, KEYS[10], KEYS[14], prefix,
             timestamp, opts)
         if result then
             return result

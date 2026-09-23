@@ -58,7 +58,7 @@ var ErrJobNotInDelayed = errors.New("mkq: job is not in the delayed state")
 
 // ErrJobNotInExpectedState is returned by Queue.RetryJob when the
 // target job is not in the source state requested via
-// WithRetryFromState (default: "failed"). BullMQ's reprocessJob-8.lua
+// WithRetryFromState (default: "failed"). BullMQ's reprocessJob-7.lua
 // returns -3 in this case.
 var ErrJobNotInExpectedState = errors.New("mkq: job is not in the expected source state for retry")
 

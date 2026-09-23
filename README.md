@@ -18,7 +18,7 @@ mkq.Process(queue, func(ctx context.Context, job *mkq.Job[Email]) (any, error) {
 
 ## Why mkq
 
-- **Wire-compatible with BullMQ v5+.** Foreign workers, bull-board,
+- **Wire-compatible with BullMQ v6.** Foreign workers, bull-board,
   and other-language tooling read mkq's queues as ordinary BullMQ
   queues — no shim, no translation. Cross-language interop is covered
   by 29 integration tests against the real BullMQ TS library.
@@ -158,10 +158,15 @@ queue.PromoteJob(ctx, jobID)
 queue.RemoveJob(ctx, jobID)
 queue.DrainPending(ctx, mkq.WithDrainDelayed(true))
 
-queue.Pause(ctx)             // stop handing jobs to workers (wait -> paused)
-queue.Resume(ctx)            // resume (paused -> wait, wakes blocking workers)
+queue.Pause(ctx)             // stop handing jobs to workers (jobs stay in wait)
+queue.Resume(ctx)            // lift the gate, wake blocking workers
 paused, _ := queue.IsPaused(ctx)
 ```
+
+Pause follows BullMQ v6: jobs are not relocated, they stay in `wait`
+and the `meta.paused` flag alone gates the dequeue. See
+[Pausing and BullMQ v5](#pausing-and-bullmq-v5) if a v5 worker shares
+the queue.
 
 ### Job mutation from inside a handler
 
@@ -224,7 +229,7 @@ Spans:
 
 ## Cross-language interop with BullMQ
 
-mkq's Redis layout is a strict subset of BullMQ v5+'s. A typical
+mkq's Redis layout is a strict subset of BullMQ v6's. A typical
 mixed-runtime deployment looks like:
 
 - **Go services** use mkq for producers and consumers.
@@ -238,6 +243,31 @@ ways: BullMQ TS Add → mkq Process and mkq Add → BullMQ TS Process,
 plus admin paths (Inspector mutations, QueueEvents subscriptions,
 shared rate-limit windows, dedup, schedulers, retry/backoff,
 stalled-job recovery).
+
+### Pausing and BullMQ v5
+
+Pause is the one place where v5 and v6 disagree on the wire, so a
+queue shared with a **v5** worker needs care.
+
+- **v5** moved every waiting job out of `wait` into a separate
+  `paused` LIST, and moved them back on resume.
+- **v6** leaves jobs in `wait` and gates the dequeue on the
+  `meta.paused` flag. The `paused` LIST is no longer written.
+
+The *gate* is compatible in both directions: v5 and v6 both refuse to
+dequeue while `meta.paused` is set, so a v5 worker sharing a queue
+that mkq paused does stop, and vice versa. What differs is **where
+the backlog sits** while the queue is paused.
+
+That matters when a queue paused by a v5 writer is read by mkq: the
+jobs are in the `paused` LIST, not in `wait`, so `Counts` and
+`ListJobs` report them under `paused` rather than `wait`. Once the
+queue is resumed the two views converge again.
+
+Nothing is stranded by the upgrade. `Resume` drains any `paused` LIST
+left behind by a v5 writer back into `wait` before lifting the flag.
+The drain is chunked at 7000 jobs per round so it cannot block Redis,
+and mkq keeps calling until the list is empty.
 
 See [docs/MIGRATING_FROM_ASYNQ.md](docs/MIGRATING_FROM_ASYNQ.md) for
 the asynq → mkq migration walkthrough.

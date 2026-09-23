@@ -45,6 +45,33 @@ func (q *Queue[T]) ListJobs(ctx context.Context, bucket JobBucket, start, end in
 		asc = "1"
 	}
 
+	// **BullMQ 6 で paused リストは使われなくなった。** pause してもジョブは
+	// wait に残るので、paused を要求されたら停止中は wait を読む。そうしないと
+	// Counts が「停止中 5 件」と言っているのに一覧が空、という食い違いが出る。
+	// 停止していなければ paused は空集合を返すのが正しい。
+	//
+	// 分岐は QueueCounts.Paused と同じ順序で判定すること。ずれると
+	// 件数と一覧が食い違う。
+	source := bucket
+	if bucket == JobBucketPaused {
+		// legacy paused リストが残っているなら、Counts と同じくそれを
+		// paused として読む。空のときだけ v6 の意味論に落とす。
+		legacy, err := q.client.rdb.LLen(ctx, q.keys.Paused()).Result()
+		if err != nil {
+			return nil, fmt.Errorf("mkq: LLEN paused: %w", err)
+		}
+		if legacy == 0 {
+			paused, err := q.IsPaused(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if !paused {
+				return []ListedJob[T]{}, nil
+			}
+			source = JobBucketWait
+		}
+	}
+
 	res, err := q.client.scripts.Run(
 		ctx,
 		lua.GetRanges,
@@ -52,7 +79,7 @@ func (q *Queue[T]) ListJobs(ctx context.Context, bucket JobBucket, start, end in
 		fmt.Sprintf("%d", start),
 		fmt.Sprintf("%d", end),
 		asc,
-		string(bucket),
+		string(source),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("mkq: getRanges: %w", err)

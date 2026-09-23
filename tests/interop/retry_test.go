@@ -2,7 +2,7 @@
 
 // TestInterop_RetryBackoff: mkq Add with WithAttempts + WithBackoff;
 // BullMQ TS Worker fails the handler each time. The vendored
-// retryJob-11.lua + moveToDelayed-12.lua wire path drives the job
+// retryJob-11.lua + moveToDelayed-11.lua wire path drives the job
 // through 3 attempts before landing in failed, and BullMQ TS
 // observes the final HASH state (atm = attempts, processedOn /
 // finishedOn populated, failedReason set).

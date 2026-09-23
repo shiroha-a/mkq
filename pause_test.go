@@ -2,6 +2,7 @@ package mkq_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,10 +12,10 @@ import (
 	"github.com/shiroha-a/mkq"
 )
 
-// TestQueue_Pause_MovesWaitToPaused verifies the BullMQ pause semantics:
-// the meta.paused flag is set and every job already in wait is parked in
-// the paused list (atomic RENAME), so Counts.Paused / IsPaused agree.
-func TestQueue_Pause_MovesWaitToPaused(t *testing.T) {
+// TestQueue_Pause_LeavesJobsInWait verifies the BullMQ 6 pause
+// semantics: the meta.paused flag is set, nothing is relocated, and
+// Counts / ListJobs / IsPaused all agree on what is held back.
+func TestQueue_Pause_LeavesJobsInWait(t *testing.T) {
 	t.Parallel()
 	prefix := uniquePrefix(t)
 	c := newClient(t, prefix)
@@ -39,13 +40,17 @@ func TestQueue_Pause_MovesWaitToPaused(t *testing.T) {
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
 
-	waitLen, err := rdb.LLen(ctx, base+"wait").Result()
+	// **BullMQ 6 で pause はジョブを動かさない。** v5 は wait を paused へ
+	// RENAME して退避していたが、6 では wait に残したまま meta.paused の
+	// フラグだけで止める。退避が無いので pause のコストがキューの長さに
+	// 依存しない。
+	waitMembers, err := rdb.LRange(ctx, base+"wait", 0, -1).Result()
 	require.NoError(t, err)
-	assert.EqualValues(t, 0, waitLen, "wait list must be empty after Pause")
+	assert.ElementsMatch(t, ids, waitMembers, "jobs must stay in wait")
 
-	pausedMembers, err := rdb.LRange(ctx, base+"paused", 0, -1).Result()
+	pausedLen, err := rdb.LLen(ctx, base+"paused").Result()
 	require.NoError(t, err)
-	assert.ElementsMatch(t, ids, pausedMembers, "all jobs must be parked in paused")
+	assert.EqualValues(t, 0, pausedLen, "the legacy paused list must not be used")
 
 	flag, err := rdb.HGet(ctx, base+"meta", "paused").Result()
 	require.NoError(t, err)
@@ -57,15 +62,26 @@ func TestQueue_Pause_MovesWaitToPaused(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 0, markerCard, "marker must be deleted by Pause")
 
+	// Counts.Paused は「停止中に溜まっている件数」を答える。ジョブは wait に
+	// あるので、同じ 3 件が Wait にも数えられる。
 	counts, err := queue.Counts(ctx)
 	require.NoError(t, err)
-	assert.EqualValues(t, 3, counts.Paused, "Counts.Paused must reflect parked jobs")
-	assert.EqualValues(t, 0, counts.Wait, "Counts.Wait must be zero while paused")
+	assert.EqualValues(t, 3, counts.Paused, "Counts.Paused must report what is waiting while paused")
+	assert.EqualValues(t, 3, counts.Wait, "the jobs are in wait, so Wait counts them too")
+
+	// 一覧も同じものを返さないと、件数と中身が食い違う。
+	listed, err := queue.ListJobs(ctx, mkq.JobBucketPaused, 0, -1, true)
+	require.NoError(t, err)
+	var listedIDs []string
+	for _, j := range listed {
+		listedIDs = append(listedIDs, j.Job.ID)
+	}
+	assert.ElementsMatch(t, ids, listedIDs, "ListJobs(paused) must agree with Counts.Paused")
 }
 
 // TestQueue_Resume_MovesPausedBackToWait verifies that Resume clears the
-// flag, returns parked jobs to wait, and pokes the marker ZSET so a
-// blocking worker wakes immediately.
+// flag, leaves the jobs available in wait, and pokes the marker ZSET so
+// a blocking worker wakes immediately.
 func TestQueue_Resume_MovesPausedBackToWait(t *testing.T) {
 	t.Parallel()
 	prefix := uniquePrefix(t)
@@ -109,10 +125,11 @@ func TestQueue_Resume_MovesPausedBackToWait(t *testing.T) {
 	assert.EqualValues(t, 0, markerScore, "marker must hold the base entry after Resume")
 }
 
-// TestQueue_Add_DuringPause_GoesToPausedList is the orphan-safety
-// acceptance criterion: a job enqueued while the queue is paused must
-// land in the paused list (not wait), and Resume must return it to wait.
-func TestQueue_Add_DuringPause_GoesToPausedList(t *testing.T) {
+// TestQueue_Add_DuringPause_GoesToWait is the orphan-safety acceptance
+// criterion under BullMQ 6: a job enqueued while the queue is paused
+// lands in wait like any other, and stays put across Resume — the gate,
+// not the job's location, is what held it back.
+func TestQueue_Add_DuringPause_GoesToWait(t *testing.T) {
 	t.Parallel()
 	prefix := uniquePrefix(t)
 	c := newClient(t, prefix)
@@ -129,13 +146,16 @@ func TestQueue_Add_DuringPause_GoesToPausedList(t *testing.T) {
 	rdb := rawClient(t)
 	base := prefix + ":deliver:"
 
-	pausedMembers, err := rdb.LRange(ctx, base+"paused", 0, -1).Result()
+	// **BullMQ 6 は pause 中でも wait に入れる。** v5 は getTargetQueueList で
+	// paused へ振り分けていたが、その関数ごと消えた。止めるのは worker 側の
+	// gate (meta.paused) で、置き場所は変えない。
+	waitMembers, err := rdb.LRange(ctx, base+"wait", 0, -1).Result()
 	require.NoError(t, err)
-	assert.Equal(t, []string{job.ID}, pausedMembers, "job added during pause must go to paused")
+	assert.Equal(t, []string{job.ID}, waitMembers, "a job added during pause goes to wait")
 
-	waitLen, err := rdb.LLen(ctx, base+"wait").Result()
+	pausedLen, err := rdb.LLen(ctx, base+"paused").Result()
 	require.NoError(t, err)
-	assert.EqualValues(t, 0, waitLen, "wait must stay empty for a job added during pause")
+	assert.EqualValues(t, 0, pausedLen, "the legacy paused list must not be used")
 
 	counts, err := queue.Counts(ctx)
 	require.NoError(t, err)
@@ -143,9 +163,15 @@ func TestQueue_Add_DuringPause_GoesToPausedList(t *testing.T) {
 
 	require.NoError(t, queue.Resume(ctx))
 
-	waitMembers, err := rdb.LRange(ctx, base+"wait", 0, -1).Result()
+	// 移動が無いので、resume してもジョブは動かない。止まっていた gate が
+	// 開くだけ。
+	waitMembers, err = rdb.LRange(ctx, base+"wait", 0, -1).Result()
 	require.NoError(t, err)
-	assert.Equal(t, []string{job.ID}, waitMembers, "job must return to wait after Resume")
+	assert.Equal(t, []string{job.ID}, waitMembers, "Resume does not move the job; it lifts the gate")
+
+	counts, err = queue.Counts(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, counts.Paused, "Counts.Paused is zero once the queue is running")
 }
 
 // TestQueue_PauseResume_Idempotent confirms pause-7.lua's no-op
@@ -292,7 +318,7 @@ func TestQueue_Pause_PrioritizedNotFetched(t *testing.T) {
 // dispatched until Resume. promoteDelayedJobs runs inside moveToActive
 // (driven by the idle worker) and honours the pause target, so the
 // matured job is parked, not handed out.
-func TestQueue_Pause_DelayedMaturesToPaused(t *testing.T) {
+func TestQueue_Pause_DelayedMaturesButIsNotProcessed(t *testing.T) {
 	t.Parallel()
 	prefix := uniquePrefix(t)
 	c := newClient(t, prefix)
@@ -328,13 +354,14 @@ func TestQueue_Pause_DelayedMaturesToPaused(t *testing.T) {
 		return n == 0
 	})
 
-	// It must have gone to paused, never to wait, and must not be processed.
-	pausedMembers, err := rdb.LRange(ctx, base+"paused", 0, -1).Result()
+	// 満期になった delayed job は wait に入る。BullMQ 6 では pause 中でも
+	// 置き場所は変わらないので、「処理されないこと」を gate 側で確かめる。
+	waitMembers, err := rdb.LRange(ctx, base+"wait", 0, -1).Result()
 	require.NoError(t, err)
-	assert.Contains(t, pausedMembers, job.ID, "matured delayed job must be parked in paused")
-	waitLen, err := rdb.LLen(ctx, base+"wait").Result()
+	assert.Contains(t, waitMembers, job.ID, "a matured delayed job lands in wait")
+	pausedLen, err := rdb.LLen(ctx, base+"paused").Result()
 	require.NoError(t, err)
-	assert.EqualValues(t, 0, waitLen, "matured delayed job must never leak into wait while paused")
+	assert.EqualValues(t, 0, pausedLen, "the legacy paused list must not be used")
 
 	select {
 	case id := <-processed:
@@ -451,4 +478,124 @@ func TestQueue_PauseResume_EmitsEvents(t *testing.T) {
 	}
 	assert.Contains(t, types, "paused", "Pause must XADD a paused event")
 	assert.Contains(t, types, "resumed", "Resume must XADD a resumed event")
+}
+
+// simulateLegacyPause puts the queue into the state a BullMQ 5 writer
+// would leave behind: the meta.paused flag set and the waiting jobs
+// parked in the separate `paused` LIST. BullMQ 6 never writes that list,
+// so it can only be produced by hand here.
+func simulateLegacyPause(t *testing.T, ctx context.Context, prefix string) {
+	t.Helper()
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+	require.NoError(t, rdb.HSet(ctx, base+"meta", "paused", 1).Err())
+	if n, err := rdb.Exists(ctx, base+"wait").Result(); err == nil && n == 1 {
+		require.NoError(t, rdb.Rename(ctx, base+"wait", base+"paused").Err())
+	}
+}
+
+// TestQueue_Counts_ReportsLegacyPausedList covers the v5 -> v6 window: a
+// queue paused by a BullMQ 5 writer still holds its backlog in the
+// legacy `paused` list. Counts must report those jobs rather than the
+// (now empty) wait list, and ListJobs must return the same set — if the
+// two disagree an admin UI shows "5 paused" over an empty table.
+func TestQueue_Counts_ReportsLegacyPausedList(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var ids []string
+	for range 3 {
+		job, err := queue.Add(ctx, testPayload{Inbox: "legacy"})
+		require.NoError(t, err)
+		ids = append(ids, job.ID)
+	}
+	simulateLegacyPause(t, ctx, prefix)
+
+	counts, err := queue.Counts(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, counts.Paused, "the legacy paused list must be reported as paused")
+	assert.EqualValues(t, 0, counts.Wait, "wait is empty in the v5 layout")
+
+	listed, err := queue.ListJobs(ctx, mkq.JobBucketPaused, 0, -1, true)
+	require.NoError(t, err)
+	var listedIDs []string
+	for _, j := range listed {
+		listedIDs = append(listedIDs, j.Job.ID)
+	}
+	assert.ElementsMatch(t, ids, listedIDs, "ListJobs(paused) must agree with Counts.Paused")
+
+	// Resume で吸い出したあとは v6 の意味論だけが残る。
+	require.NoError(t, queue.Resume(ctx))
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+	pausedLen, err := rdb.LLen(ctx, base+"paused").Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, pausedLen, "Resume must drain the legacy list")
+
+	waitMembers, err := rdb.LRange(ctx, base+"wait", 0, -1).Result()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, ids, waitMembers, "drained jobs must land in wait")
+
+	counts, err = queue.Counts(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, counts.Paused, "nothing is held back once resumed")
+	assert.EqualValues(t, 3, counts.Wait)
+
+	listed, err = queue.ListJobs(ctx, mkq.JobBucketPaused, 0, -1, true)
+	require.NoError(t, err)
+	assert.Empty(t, listed, "a running queue holds nothing back, so paused is empty")
+}
+
+// TestQueue_Resume_DrainsLegacyPausedListInChunks covers the batching in
+// pause-7.lua: it moves at most 7000 jobs per call so a long list cannot
+// block Redis, and returns how many are left. Resume has to keep calling
+// until that reaches zero, otherwise a queue that BullMQ 5 paused with a
+// large backlog silently strands everything past the first chunk.
+func TestQueue_Resume_DrainsLegacyPausedListInChunks(t *testing.T) {
+	t.Parallel()
+	prefix := uniquePrefix(t)
+	c := newClient(t, prefix)
+	queue := mkq.Define[testPayload](c, "deliver")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rdb := rawClient(t)
+	base := prefix + ":deliver:"
+
+	// wait を非空にしておく。空だと Lua は RENAME の一発で済ませてしまい、
+	// チャンク分割の経路を通らない。
+	require.NoError(t, rdb.LPush(ctx, base+"wait", "sentinel").Err())
+
+	// 7000 を 1 件超えさせる。ちょうど 2 ラウンド必要になる。
+	const parked = 7001
+	ids := make([]any, 0, parked)
+	for i := range parked {
+		ids = append(ids, fmt.Sprintf("legacy-%d", i))
+	}
+	require.NoError(t, rdb.RPush(ctx, base+"paused", ids...).Err())
+	require.NoError(t, rdb.HSet(ctx, base+"meta", "paused", 1).Err())
+
+	require.NoError(t, queue.Resume(ctx))
+
+	pausedLen, err := rdb.LLen(ctx, base+"paused").Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, pausedLen, "every chunk must be drained, not just the first 7000")
+
+	waitLen, err := rdb.LLen(ctx, base+"wait").Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, parked+1, waitLen, "all parked jobs plus the sentinel must be in wait")
+
+	// wait の末尾が次に処理される側。paused リストの末尾 (= 最も古い
+	// parked job) がそこへ来ていれば、2 ラウンドに割れても FIFO が保たれて
+	// いる。逆順に積むと古いジョブが最後まで処理されない。
+	next, err := rdb.LIndex(ctx, base+"wait", -1).Result()
+	require.NoError(t, err)
+	assert.Equal(t, "legacy-7000", next, "the oldest parked job must be the next one consumed")
 }

@@ -18,8 +18,8 @@ func TestPreprocess_VendoredEntryPoints(t *testing.T) {
 		"extendLock-2",
 		"releaseLock-1",
 		"retryJob-11",
-		"moveToDelayed-12",
-		"moveStalledJobsToWait-8",
+		"moveToDelayed-11",
+		"moveStalledJobsToWait-9",
 		"addJobScheduler-11",
 		"updateJobScheduler-12",
 		"updateProgress-3",
@@ -30,7 +30,7 @@ func TestPreprocess_VendoredEntryPoints(t *testing.T) {
 		"removeJob-2",
 		"drain-5",
 		"promote-9",
-		"reprocessJob-8",
+		"reprocessJob-7",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
