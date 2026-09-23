@@ -6,16 +6,17 @@ import "time"
 type WorkerOption func(*workerConfig)
 
 type workerConfig struct {
-	concurrency      int
-	lockDuration     time.Duration
-	workerName       string
-	idlePollInterval time.Duration
-	stalledInterval  time.Duration
-	maxStalledCount  int
-	limiter          *workerLimiter
-	maxDataPoints    int // 0 = disabled (BullMQ-spec metrics off)
-	backoffStrategy  CustomBackoffFunc
-	backoffFunc      BackoffFunc
+	concurrency        int
+	lockDuration       time.Duration
+	workerName         string
+	idlePollInterval   time.Duration
+	stalledInterval    time.Duration
+	maxStalledCount    int
+	limiter            *workerLimiter
+	maxDataPoints      int // 0 = disabled (BullMQ-spec metrics off)
+	backoffStrategy    CustomBackoffFunc
+	backoffFunc        BackoffFunc
+	retryDelayOverride RetryDelayFunc
 }
 
 type workerLimiter struct {
@@ -190,4 +191,36 @@ func WithJobMetrics(maxDataPoints int) WorkerOption {
 		}
 		c.maxDataPoints = maxDataPoints
 	}
+}
+
+// WithRetryDelayOverride registers a hook consulted before the job's
+// configured backoff, whatever its type — and even for jobs carrying no
+// backoff at all.
+//
+// It exists for the case the BullMQ-shaped hooks cannot express: a
+// queue on exponential backoff that should nonetheless honour a
+// 429's Retry-After when the server sends one.
+//
+//	mkq.WithRetryDelayOverride(func(bc mkq.BackoffContext) (time.Duration, bool) {
+//	    var ra *RetryAfterError
+//	    if errors.As(bc.Err, &ra) {
+//	        return min(ra.After, time.Hour), true
+//	    }
+//	    return 0, false // 他は設定どおりの exponential
+//	})
+//
+// Declining leaves everything to the configured backoff, so this
+// composes with WithBackoffStrategy / WithBackoffStrategyFunc rather
+// than replacing them: those two stay the BullMQ
+// settings.backoffStrategy analogue for custom-typed jobs.
+//
+// **決めるのは「どれだけ待つか」だけ。** 「再試行するか」は先に
+// WithAttempts と ErrUnrecoverable で決まっていて、そこで打ち切られた
+// ジョブに対しては呼ばれない。試行回数を伸ばす手段ではない (打ち切り側に
+// 回すことはできる — 負の値を返せばよい)。
+//
+// The job's `opts.backoff` is not rewritten, so a BullMQ worker in
+// another language sharing the queue keeps using its own backoff.
+func WithRetryDelayOverride(fn RetryDelayFunc) WorkerOption {
+	return func(c *workerConfig) { c.retryDelayOverride = fn }
 }

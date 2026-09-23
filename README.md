@@ -118,6 +118,15 @@ worker, err := mkq.Process(queue,
     },
     mkq.WithConcurrency(16),
     mkq.WithLockDuration(30*time.Second),
+
+    // 普段は WithBackoff どおり。相手が Retry-After を返したときだけ従う。
+    mkq.WithRetryDelayOverride(func(bc mkq.BackoffContext) (time.Duration, bool) {
+        var ra *RateLimitedError
+        if errors.As(bc.Err, &ra) {
+            return min(ra.RetryAfter, time.Hour), true
+        }
+        return 0, false // 意見なし = 設定どおりの backoff
+    }),
 )
 if err != nil {
     log.Fatal(err)
@@ -298,8 +307,10 @@ the asynq → mkq migration walkthrough.
 
 - **Job lifecycle**: Add / Process / retry-on-error / WithAttempts /
   WithBackoff (Fixed, Exponential, jitter, custom strategy — with or
-  without job context) / panic
-  recovery / ErrUnrecoverable.
+  without job context) / panic recovery / ErrUnrecoverable.
+  WithRetryDelayOverride covers "usually the configured backoff, but
+  honour this server's Retry-After when it sends one" — an mkq
+  extension that changes nothing on the wire.
 - **Job options**: WithDelay, WithPriority, WithLifo,
   WithKeepCompleted/Failed (count + age), WithDeduplication / WithUnique,
   WithJobName, WithJobID.
@@ -309,7 +320,7 @@ the asynq → mkq migration walkthrough.
 - **Worker options**: WithConcurrency, WithLockDuration,
   WithStalledInterval, WithMaxStalledCount, WithIdlePollInterval,
   WithRateLimit, WithWorkerName, WithBackoffStrategy /
-  WithBackoffStrategyFunc, WithJobMetrics.
+  WithBackoffStrategyFunc, WithRetryDelayOverride, WithJobMetrics.
 - **Recurring schedules**: every-mode and cron-pattern mode, with
   WithScheduleLimit / StartDate / EndDate / Timezone / Immediately, and
   per-iteration retention via WithScheduleKeepCompleted /

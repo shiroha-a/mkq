@@ -77,6 +77,9 @@ type Worker struct {
 	// backoffFunc is the context-aware form of the same hook. It wins
 	// when both are registered.
 	backoffFunc BackoffFunc
+	// retryDelayOverride is consulted before either of the above, for
+	// every backoff type. See WithRetryDelayOverride.
+	retryDelayOverride RetryDelayFunc
 	// rng returns a random float64 in [0, 1) for jitter. Defaults to
 	// math/rand/v2's package source; overridable in tests for
 	// deterministic jitter assertions.
@@ -163,23 +166,24 @@ func Process[T any](q *Queue[T], h Handler[T], opts ...WorkerOption) (*Worker, e
 	jobsCtx, jobsCancel := context.WithCancel(context.Background())
 	qk := newQueueKeys(q)
 	w := &Worker{
-		cfg:             cfg,
-		keys:            qk,
-		wakeKey:         qk.builder.Base() + "mkq:wake:" + uuid.NewString(),
-		queueName:       q.name,
-		scripts:         q.client.scripts,
-		rdb:             q.client.rdb,
-		logger:          q.client.logger,
-		metrics:         q.client.metrics,
-		tracer:          q.client.tracer,
-		runCtx:          ctx,
-		runCancel:       cancel,
-		jobsCtx:         jobsCtx,
-		jobsCancel:      jobsCancel,
-		stopDone:        make(chan struct{}),
-		backoffStrategy: cfg.backoffStrategy,
-		backoffFunc:     cfg.backoffFunc,
-		rng:             rand.Float64,
+		cfg:                cfg,
+		keys:               qk,
+		wakeKey:            qk.builder.Base() + "mkq:wake:" + uuid.NewString(),
+		queueName:          q.name,
+		scripts:            q.client.scripts,
+		rdb:                q.client.rdb,
+		logger:             q.client.logger,
+		metrics:            q.client.metrics,
+		tracer:             q.client.tracer,
+		runCtx:             ctx,
+		runCancel:          cancel,
+		jobsCtx:            jobsCtx,
+		jobsCancel:         jobsCancel,
+		stopDone:           make(chan struct{}),
+		backoffStrategy:    cfg.backoffStrategy,
+		backoffFunc:        cfg.backoffFunc,
+		retryDelayOverride: cfg.retryDelayOverride,
+		rng:                rand.Float64,
 	}
 
 	// BZPopMin の awaitMarker は worker slot ごとに 1 connection を専有
@@ -1433,6 +1437,10 @@ func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason s
 // layering jitter and the custom strategy on top of the built-in
 // fixed / exponential base computed by computeBackoffDelay.
 //
+// A RetryDelayFunc registered with WithRetryDelayOverride is consulted
+// first, whatever the type and even when the job carries no backoff at
+// all. Declining there falls through to everything below.
+//
 // For built-in types the un-jittered base is computed wire-faithfully
 // and, when BackoffStrategy.Jitter > 0, spread via applyJitter using
 // the BullMQ formula. For any non-built-in type ("custom") the
@@ -1442,10 +1450,27 @@ func (w *Worker) retryDelayed(jobID, token string, delay time.Duration, reason s
 // job falls back to immediate retry (delay 0) rather than panicking, so
 // foreign custom-typed jobs never wedge the worker.
 func (w *Worker) computeRetryDelay(b *BackoffStrategy, bc BackoffContext) time.Duration {
-	if b == nil || bc.AttemptsMade < 1 {
+	if bc.AttemptsMade < 1 {
 		return 0
 	}
-	bc.BackoffType = b.Type
+	if b != nil {
+		bc.BackoffType = b.Type
+	}
+
+	// **型に関係なく先に相談する。** 「普段は exponential でよいが、相手が
+	// Retry-After を返したときだけそれに従う」は backoff type を custom に
+	// しないと書けなかった。custom にするとカーブ全体を呼び出し側が持つ
+	// ことになるうえ、`opts.backoff.type` が Redis に載って BullMQ TS 側の
+	// 挙動まで変わる。意見が無ければ下の分岐に委ねられる形にしてある。
+	if w.retryDelayOverride != nil {
+		if d, ok := w.callRetryDelayOverride(bc); ok {
+			return d
+		}
+	}
+
+	if b == nil {
+		return 0
+	}
 	switch b.Type {
 	case "fixed", "exponential":
 		base := computeBackoffDelay(b, bc.AttemptsMade)
@@ -1489,6 +1514,30 @@ func (w *Worker) callBackoffStrategy(bc BackoffContext) (d time.Duration) {
 		return w.backoffStrategy(bc.AttemptsMade)
 	}
 	return 0
+}
+
+// callRetryDelayOverride invokes the registered override under panic
+// recovery, for the same reason callBackoffStrategy does: this runs
+// after runHandler's recover has returned and the dispatch loop has
+// none of its own.
+//
+// A panic is treated as "no opinion" rather than "retry immediately".
+// Swallowing it into delay 0 would silently turn a considered backoff
+// into a hot loop against whatever just failed.
+func (w *Worker) callRetryDelayOverride(bc BackoffContext) (d time.Duration, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if w.logger != nil {
+				w.logger.Error("mkq: retry delay override panicked; falling back to the configured backoff",
+					slog.String(AttrQueue, w.queueName),
+					slog.String(AttrJobID, bc.JobID),
+					slog.Any("panic", r),
+				)
+			}
+			d, ok = 0, false
+		}
+	}()
+	return w.retryDelayOverride(bc)
 }
 
 // jobOpts is the subset of the per-job opts JSON that the worker
