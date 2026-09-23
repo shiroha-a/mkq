@@ -86,7 +86,12 @@ func TestSchedule_RetentionSurvivesReschedule(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	require.NoError(t, queue.UpsertScheduleEvery(ctx, "ticker", 150*time.Millisecond,
+	// **間隔は長く取る。** `UpsertScheduleEvery` は 1 本目を即座に wait へ
+	// 積むので、worker が 1 本処理すれば 2 本目が delayed に入る。短い間隔
+	// (150ms) にすると 2 本目がすぐ満期になって wait へ昇格し、delayed を
+	// 見たときには空、ということが起きる (CI で実測)。長くしても 1 本目は
+	// 即時なので、テストが遅くなることはない。
+	require.NoError(t, queue.UpsertScheduleEvery(ctx, "ticker", time.Hour,
 		testPayload{Inbox: "x"},
 		mkq.WithScheduleKeepCompletedAge(7*24*time.Hour),
 	))
@@ -99,12 +104,21 @@ func TestSchedule_RetentionSurvivesReschedule(t *testing.T) {
 	require.NoError(t, err)
 	defer stopWorker(t, worker)
 
-	// 2 本目以降が積まれるまで待つ。1 本目は Upsert が積んだもの。
-	waitFor(t, ctx, 50*time.Millisecond, func() bool { return seen.Load() >= 2 })
-
 	rdb := rawClient(t)
-	ids, err := rdb.ZRange(ctx, prefix+":tick:delayed", 0, -1).Result()
-	require.NoError(t, err)
+	// 1 本目 (Upsert が積んだもの) を処理させ、worker が 2 本目を delayed へ
+	// 積むまで待つ。
+	var ids []string
+	waitFor(t, ctx, 20*time.Millisecond, func() bool {
+		if seen.Load() < 1 {
+			return false
+		}
+		got, err := rdb.ZRange(ctx, prefix+":tick:delayed", 0, -1).Result()
+		if err != nil || len(got) == 0 {
+			return false
+		}
+		ids = got
+		return true
+	})
 	require.NotEmpty(t, ids, "the worker must have queued the next iteration")
 	require.True(t, strings.HasPrefix(ids[0], "repeat:ticker:"))
 
