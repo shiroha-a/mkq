@@ -6,6 +6,38 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A schedule's job template now survives rescheduling whole. mkq's
+  worker rebuilds the per-iteration options from the scheduler HASH
+  when it queues the next run, and it only copied across the fields it
+  had names for — so everything else was dropped from the second
+  iteration onward.
+
+  The visible case is a scheduler created by a **BullMQ TS** writer,
+  since mkq's own `ScheduleOption`s cannot set these yet:
+
+  ```
+  TS queued iteration 1: {"attempts":3,"priority":5,
+                          "backoff":{"type":"exponential","delay":1000},...}
+  mkq queued iteration 2: {"jobId":"...","repeat":{"every":200},"delay":183}
+  ```
+
+  `attempts` going missing means the job stops retrying. `priority`
+  going missing changes **where the job is stored** — the prioritized
+  ZSET rather than the wait list — so it is a wire-level difference,
+  not just a behavioural one.
+
+  The template is now carried across as a whole rather than
+  field-by-field, which is what BullMQ TS does (`{...opts, repeat}` in
+  `job-scheduler.ts`). An option mkq has never heard of rides along
+  instead of being silently discarded.
+
+  `repeat.count` stays excluded on purpose: BullMQ recomputes it from
+  the scheduler HASH's `ic` at re-upsert time, so carrying a stale
+  Go-side value would race.
+
+
 ## [1.2.0] - 2026-09-23
 
 ### Added

@@ -2,6 +2,8 @@ package proto
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -78,16 +80,30 @@ type ScheduleTemplateOpts struct {
 	// BullMQ's "keep forever".
 	RemoveOnComplete *RetentionLimit
 	RemoveOnFail     *RetentionLimit
-}
 
-// IsZero reports whether the template carries nothing, so callers can
-// keep writing the empty map the Lua reads as "no overrides".
-func (t ScheduleTemplateOpts) IsZero() bool {
-	return t.RemoveOnComplete == nil && t.RemoveOnFail == nil
+	// Extra carries the template fields mkq has no typed option for —
+	// `attempts`, `backoff`, `priority` and anything else a writer put
+	// there.
+	//
+	// **これが無いと、再スケジュールのたびに template が痩せる。** mkq の
+	// worker は scheduler HASH から per-iteration opts を組み直すので、
+	// 知っているフィールドだけを写すと知らないものが毎回落ちる。BullMQ TS が
+	// `attempts: 3` 付きで作った schedule を mkq が回すと 2 本目から再試行
+	// しなくなり、`priority` に至っては置き場所 (prioritized ZSET か wait か)
+	// まで変わる。BullMQ TS も `{...opts, repeat}` と丸ごと展開している。
+	//
+	// Populated by DecodeScheduleTemplateOpts on the reschedule path;
+	// nil when the template is built from ScheduleOptions.
+	Extra map[string]any
 }
 
 func (t ScheduleTemplateOpts) toMap() map[string]any {
-	m := map[string]any{}
+	m := make(map[string]any, len(t.Extra)+2)
+	for k, v := range t.Extra {
+		m[k] = v
+	}
+	// 型付きフィールドが後。ScheduleOption で明示された retention は
+	// 持ち越した値より優先する。
 	if v := encodeRetentionLimit(t.RemoveOnComplete); v != nil {
 		m["removeOnComplete"] = v
 	}
@@ -108,55 +124,60 @@ func EncodeScheduleTemplateOpts(t ScheduleTemplateOpts) ([]byte, error) {
 }
 
 // DecodeScheduleTemplateOpts reads back the JSON the Lua wrote to the
-// scheduler HASH `opts` field.
+// scheduler HASH `opts` field, whole.
 //
 // **worker が次の iteration を積むときに要る。** mkq の worker は
 // scheduler HASH から every / pattern 等を読んで per-iteration opts を
-// 組み直すので、template に載せた retention をここで拾わないと 2 回目
-// 以降の iteration だけ retention が落ちる。
+// 組み直すので、ここで template を拾わないと 2 回目以降の iteration から
+// 落ちる。retention だけでなく `attempts` / `backoff` / `priority` も同じ。
 //
-// Unknown fields are ignored: this only needs the parts mkq puts back
-// on the next iteration, and a foreign writer may have stored more.
-func DecodeScheduleTemplateOpts(raw string) ScheduleTemplateOpts {
+// 個別のフィールドを知ろうとせず丸ごと持ち越すのは、mkq が知らない
+// オプションを BullMQ が足しても勝手に落とさないため。BullMQ TS も
+// `{...opts, repeat}` と展開していて、中身を検査していない。
+func DecodeScheduleTemplateOpts(raw string) (ScheduleTemplateOpts, error) {
 	if raw == "" || raw == "{}" {
-		return ScheduleTemplateOpts{}
+		return ScheduleTemplateOpts{}, nil
 	}
-	var wire struct {
-		RemoveOnComplete json.RawMessage `json:"removeOnComplete"`
-		RemoveOnFail     json.RawMessage `json:"removeOnFail"`
+	// **UseNumber が要る。** 素の Unmarshal は数値をすべて float64 にするので、
+	// msgpack に float64 として載り、Lua を通って `attempts: 3` が `3.0` で
+	// 書き戻される。整数は整数のまま持ち越す。
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		// **壊れていても再スケジュールは止めない。** 止めると定期ジョブが
+		// 永久に出なくなる。ただし template を落とすと attempts / priority が
+		// 静かに消えるので、呼び出し側が気付けるようエラーを返す。
+		return ScheduleTemplateOpts{}, fmt.Errorf("decode scheduler template opts: %w", err)
 	}
-	if err := json.Unmarshal([]byte(raw), &wire); err != nil {
-		// 壊れた opts で再スケジュールを止めるほうが害が大きい。
-		// retention を落として続ける。
-		return ScheduleTemplateOpts{}
-	}
-	return ScheduleTemplateOpts{
-		RemoveOnComplete: decodeRetentionLimit(wire.RemoveOnComplete),
-		RemoveOnFail:     decodeRetentionLimit(wire.RemoveOnFail),
-	}
+	return ScheduleTemplateOpts{Extra: normaliseJSONNumbers(m).(map[string]any)}, nil
 }
 
-// decodeRetentionLimit accepts both wire forms BullMQ persists: a bare
-// number (count shorthand) and a {count?, age?} object.
-func decodeRetentionLimit(raw json.RawMessage) *RetentionLimit {
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil
+// normaliseJSONNumbers turns json.Number back into int64 where the
+// value is integral and float64 otherwise, recursively.
+func normaliseJSONNumbers(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, vv := range t {
+			t[k] = normaliseJSONNumbers(vv)
+		}
+		return t
+	case []any:
+		for i, vv := range t {
+			t[i] = normaliseJSONNumbers(vv)
+		}
+		return t
+	case json.Number:
+		if i, err := t.Int64(); err == nil {
+			return i
+		}
+		if f, err := t.Float64(); err == nil {
+			return f
+		}
+		// int でも float でも読めない数値は諦めて文字列のまま置く。
+		return t.String()
 	}
-	var n int
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return &RetentionLimit{Count: &n}
-	}
-	var obj struct {
-		Count *int `json:"count"`
-		Age   *int `json:"age"`
-	}
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil
-	}
-	if obj.Count == nil && obj.Age == nil {
-		return nil
-	}
-	return &RetentionLimit{Count: obj.Count, AgeSeconds: obj.Age}
+	return v
 }
 
 // EncodeScheduleDelayedOpts builds ARGV[6] for addJobScheduler-11 (and
